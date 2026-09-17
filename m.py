@@ -2,18 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.1 — разрыв undo-группы на движении курсора.
+Версия 6.2 — поддержка мыши в редакторе и файловом менеджере.
 
-Изменения относительно 6.0:
-  • Стрелки/Home/End теперь сбрасывают группу undo: движение курсора
-    разрывает непрерывную печать. Ctrl+Z после «abc ← d» откатывает
-    сначала 'd', потом 'abc' — как в VS Code / vim.
-  • _push_undo() (для явных операций) сбрасывает группу undo сам —
-    защита от будущих footgun-вызовов.
-  • Убрано дублирование _reset_undo_group() в editor_replace.
-  • Уточнён docstring: группируется «непрерывная печать», а не
-    «вставка большого текста» (паста через get_wch идёт посимвольно,
-    и группировка зависит от таймингов).
+Изменения относительно 6.1:
+  • Клик мыши в редакторе переносит курсор в точку клика.
+    Позиция колонки пересчитывается через обратное к _visual_col
+    преобразование — табы, CJK и эмодзи учитываются корректно.
+  • Клик в файловом менеджере выбирает элемент в панели.
+    Двойной клик открывает файл/папку. Клик по заголовку панели
+    делает её активной.
+  • Колесо мыши (Button4/Button5) скроллит список в файловом
+    менеджере и текст в редакторе.
+  • _col_to_char() — обратное к _visual_col() преобразование.
+  • mousemask включается в __init__ и при KEY_RESIZE.
+  • Клик в редакторе сбрасывает undo-группу: не продолжает
+    непрерывный ввод после движения курсора мышью.
 """
 
 import curses
@@ -156,10 +159,6 @@ class M:
     MODE_TRASH = "trash"
     MODE_ARCHIVE = "archive"
 
-    # ── Группировка undo в редакторе ──────────────────────────────
-    # Непрерывная печать/backspace одного типа в этом окне = одна
-    # группа. Любая смена типа правки, движение курсора, Enter/Tab,
-    # undo/redo, save, open или replace разрывают группу.
     UNDO_GROUP_WINDOW = 0.3
 
     def __init__(self, stdscr):
@@ -200,9 +199,12 @@ class M:
         self.ed_search_hits = []
         self.ed_search_idx = -1
 
-        # Состояние группировки undo в редакторе
         self._last_edit_time = 0.0
-        self._last_edit_kind = None   # None | "insert" | "delete" | "other"
+        self._last_edit_kind = None
+
+        # Состояние для распознавания двойного клика
+        self._last_click_time = 0.0
+        self._last_click_pos = (-1, -1)
 
         self.prompt_active = False
         self.prompt_text = ""
@@ -216,6 +218,7 @@ class M:
         self.load_config()
         self.load_bookmarks()
         self.init_colors()
+        self._init_mouse()
         self.refresh_pane(0)
         self.refresh_pane(1)
 
@@ -296,6 +299,136 @@ class M:
         except Exception:
             return extra
 
+    # ==================== МЫШЬ ====================
+    def _init_mouse(self):
+        """Включает отслеживание событий мыши.
+        В терминалах без поддержки — просто не будет событий,
+        ничего не сломается."""
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        except Exception:
+            pass
+        # Дефолтный mouseinterval оставляем — нужен для распознавания
+        # BUTTON1_DOUBLE_CLICKED. Явно нулить не надо.
+
+    def _handle_mouse(self):
+        try:
+            _mid, mx, my, _mz, bstate = curses.getmouse()
+        except Exception:
+            return
+
+        # Колесо мыши — универсально для всех режимов
+        scroll_up = getattr(curses, "BUTTON4_PRESSED", 0)
+        scroll_down = getattr(curses, "BUTTON5_PRESSED", 0)
+        if scroll_up and (bstate & scroll_up):
+            self._mouse_scroll(-3)
+            return
+        if scroll_down and (bstate & scroll_down):
+            self._mouse_scroll(3)
+            return
+
+        # Левый клик: одинарный или двойной
+        is_double = bool(bstate & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0))
+        is_single = bool(bstate & getattr(curses, "BUTTON1_CLICKED", 0))
+        if not (is_double or is_single):
+            return
+
+        # В активном промпте мышь не обрабатываем — чтобы клик случайно
+        # не увёл курсор из поля ввода
+        if self.prompt_active:
+            return
+
+        if self.mode == self.MODE_EDITOR:
+            self._mouse_editor(mx, my)
+        elif self.mode == self.MODE_FILES:
+            self._mouse_files(mx, my, is_double)
+
+    def _mouse_scroll(self, delta):
+        """delta < 0 — вверх, delta > 0 — вниз. 3 строки за тик."""
+        if self.mode == self.MODE_EDITOR:
+            key = curses.KEY_UP if delta < 0 else curses.KEY_DOWN
+            for _ in range(abs(delta)):
+                self.editor_edit(key, arrows=True)
+            self.clamp_cursor()
+        elif self.mode == self.MODE_FILES:
+            idx = self.active
+            step = -abs(delta) if delta < 0 else abs(delta)
+            new_sel = self.selected[idx] + step
+            new_sel = max(0, min(new_sel, len(self.items[idx]) - 1))
+            self.selected[idx] = new_sel
+
+    def _mouse_files(self, mx, my, is_double_from_curses):
+        h, w = self.stdscr.getmaxyx()
+        half = max(10, w // 2)
+        pane = 0 if mx < half else 1
+
+        # Клик по заголовку панели — сделать её активной
+        if my == 1:
+            self.active = pane
+            return
+
+        # Клик в области списка файлов: строки 2..h-3
+        if not (2 <= my < h - 2):
+            return
+
+        visible = max(1, h - 4)
+        sel = self.selected[pane]
+        start = 0
+        if sel >= visible:
+            start = sel - visible + 1
+
+        row = my - 2
+        idx = start + row
+        if idx < 0 or idx >= len(self.items[pane]):
+            return
+
+        # Активируем панель, куда кликнули
+        self.active = pane
+
+        # Двойной клик: либо curses сам распознал, либо по таймеру
+        is_double = bool(is_double_from_curses)
+        now = time.monotonic()
+        if not is_double:
+            if (self._last_click_time > 0
+                    and (now - self._last_click_time) < 0.4
+                    and self._last_click_pos == (mx, my)):
+                is_double = True
+
+        self.selected[pane] = idx
+
+        if is_double:
+            self._last_click_time = 0.0
+            self._last_click_pos = (-1, -1)
+            self.open_item()
+        else:
+            self._last_click_time = now
+            self._last_click_pos = (mx, my)
+
+    def _mouse_editor(self, mx, my):
+        h, w = self.stdscr.getmaxyx()
+
+        # Область текста в редакторе: строки 1..h-3
+        # (0 — заголовок, h-2 — промпт/сообщение, h-1 — статус)
+        if not (1 <= my < h - 2):
+            return
+
+        visible_h = max(1, h - 3)
+        cy = self.ed_cursor[0]
+        start = 0
+        if cy >= visible_h:
+            start = cy - visible_h + 1
+
+        line_idx = start + (my - 1)
+        if line_idx < 0 or line_idx >= len(self.ed_buffer):
+            return
+
+        line = self.ed_buffer[line_idx]
+        cx = self._col_to_char(line, mx)
+        self.ed_cursor = [line_idx, cx]
+        self.clamp_cursor()
+        # Клик — точка разрыва undo-группы, как и стрелки
+        self._reset_undo_group()
+
     # ==================== ВВОД ====================
     def _get_key(self):
         """Универсальное чтение клавиши с поддержкой Unicode."""
@@ -316,8 +449,6 @@ class M:
 
         if isinstance(ch, str):
             if len(ch) == 0:
-                # get_wch() иногда возвращает пустую строку —
-                # трактуем как отсутствие события
                 return -1
             if len(ch) == 1 and ord(ch) < 128:
                 return ord(ch)
@@ -332,11 +463,8 @@ class M:
 
     @staticmethod
     def _char_width(ch):
-        """Визуальная ширина одного символа:
-        0 — combining / ZWJ / VS15 / VS16,
-        2 — Wide/Fullwidth (CJK, эмодзи),
-        1 — всё остальное.
-        Табы обрабатываются отдельно."""
+        """0 — combining / ZWJ / VS15 / VS16,
+        2 — Wide/Fullwidth (CJK, эмодзи), 1 — остальное."""
         cp = ord(ch)
         if cp in (0x200D, 0xFE0E, 0xFE0F):
             return 0
@@ -363,6 +491,23 @@ class M:
                 col += M._char_width(ch)
         return col
 
+    @staticmethod
+    def _col_to_char(line, target_col, tabstop=TABSTOP):
+        """Обратное к _visual_col: визуальная колонка → индекс символа.
+        Возвращает индекс в диапазоне [0, len(line)]."""
+        if target_col <= 0:
+            return 0
+        col = 0
+        for i, ch in enumerate(line):
+            if ch == '\t':
+                nxt = ((col // tabstop) + 1) * tabstop
+            else:
+                nxt = col + M._char_width(ch)
+            if nxt > target_col:
+                return i
+            col = nxt
+        return len(line)
+
     # ==================== ПАНЕЛИ ====================
     def refresh_pane(self, idx):
         try:
@@ -387,7 +532,6 @@ class M:
 
     # ==================== ВЫВОД ====================
     def addstr(self, y, x, text, attr=0):
-        """Рисует текст, обрезая по ВИЗУАЛЬНОЙ ширине."""
         try:
             h, w = self.stdscr.getmaxyx()
             if y < 0 or y >= h or x < 0 or x >= w:
@@ -463,7 +607,7 @@ class M:
                 f"[{i+1}]" if i == self.active_tab else f" {i+1} "
                 for i in range(len(self.tabs))
             )
-        title = f" M v6.1 {tab_label} — Файлы "
+        title = f" M v6.2 {tab_label} — Файлы "
         self.addstr(0, 0, title, self.cp(1, curses.A_BOLD))
 
         half = max(10, w // 2)
@@ -718,7 +862,7 @@ class M:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         lines = [
-            "  M v6.1 — универсальный инструмент Termux  ",
+            "  M v6.2 — универсальный инструмент Termux  ",
             "",
             "  ФЛАГИ:  M -e [FILE] | -m NAME | -i SRC DST | -c SRC DST | -h | -v",
             "",
@@ -743,6 +887,11 @@ class M:
             "    x            хуки",
             "    ?            справка",
             "    q            выход",
+            "",
+            "  МЫШЬ:",
+            "    клик         выбрать файл / панель",
+            "    двойной клик открыть",
+            "    колесо       скролл",
             "",
             "  РЕДАКТОР: F1 или Ctrl+P внутри редактора",
             "",
@@ -787,6 +936,10 @@ class M:
             "    Ctrl+G       следующее совпадение (после Ctrl+F)",
             "    Ctrl+W       поиск слова под курсором",
             "    Ctrl+R       замена (формат: старый|новый)",
+            "",
+            "  МЫШЬ:",
+            "    клик         перенести курсор в точку клика",
+            "    колесо       скролл текста",
             "",
             "  Нажми любую клавишу…",
         ]
@@ -1270,6 +1423,11 @@ class M:
                 time.sleep(0.02)
                 continue
 
+            # Событие мыши — обрабатываем отдельно
+            if key == curses.KEY_MOUSE:
+                self._handle_mouse()
+                continue
+
             if self.prompt_active:
                 self.handle_prompt_key(key)
                 continue
@@ -1317,7 +1475,7 @@ class M:
             return
         if key in (curses.KEY_BACKSPACE, 127, 8):
             self.prompt_input = self.prompt_input[:-1]
-        elif key == 9:  # Tab
+        elif key == 9:
             self.set_message("Tab недоступен в поле ввода.")
         elif isinstance(key, str):
             self.prompt_input += key
@@ -1328,7 +1486,7 @@ class M:
     def handle_files_key(self, key):
         idx = self.active
 
-        if key == 9:  # Tab
+        if key == 9:
             self.active = 1 - self.active
             self.fm_hits = []
             self.fm_hit_idx = -1
@@ -1411,6 +1569,7 @@ class M:
             self.return_mode = self.MODE_FILES
             self.mode = self.MODE_HELP
         elif key == curses.KEY_RESIZE:
+            self._init_mouse()
             self.refresh_pane(0)
             self.refresh_pane(1)
 
@@ -1829,17 +1988,11 @@ class M:
         return (list(self.ed_buffer), list(self.ed_cursor), self.ed_modified)
 
     def _push_undo(self):
-        """Безусловный push + сброс группы. Для явных операций
-        (замена, undo, redo и т.п.): после такой операции следующая
-        правка всегда начинает новую группу."""
         self.ed_undo_stack.append(self._snapshot())
         self.ed_redo_stack.clear()
         self._reset_undo_group()
 
     def _push_undo_for_edit(self, kind):
-        """Push с группировкой. kind ∈ {"insert", "delete", "other"}.
-        Непрерывный ввод одного типа в пределах UNDO_GROUP_WINDOW
-        не создаёт новый snapshot."""
         now = time.monotonic()
         continuous = (
             kind in ("insert", "delete")
@@ -1863,7 +2016,7 @@ class M:
             self.ed_buffer = list(buf)
             self.ed_cursor = list(cur)
             self.ed_modified = mod
-            self._reset_undo_group()   # следующая правка — новая группа
+            self._reset_undo_group()
             self.set_message("Отменено.")
         else:
             self.set_message("Нечего отменять.")
@@ -1912,6 +2065,7 @@ class M:
             self.mode = self.MODE_HELP_EDITOR
             return
         if key == curses.KEY_RESIZE:
+            self._init_mouse()
             return
 
         if key == 24:  # Ctrl+X
@@ -1960,7 +2114,6 @@ class M:
                      self.editor_replace)
             return
 
-        # Определяем вид правки для группировки undo
         edit_kind = None
         if isinstance(key, str):
             edit_kind = "insert"
@@ -1968,7 +2121,7 @@ class M:
             edit_kind = "insert"
         elif key in (curses.KEY_BACKSPACE, 127, 8, curses.KEY_DC):
             edit_kind = "delete"
-        elif key in (10, 13, 9):   # Enter, Tab
+        elif key in (10, 13, 9):
             edit_kind = "other"
 
         if edit_kind is not None:
@@ -1976,8 +2129,6 @@ class M:
             self.editor_edit(key, arrows=True)
             self.clamp_cursor()
         else:
-            # Стрелки, Home/End и прочее — движение курсора разрывает
-            # undo-группу: следующая правка начнёт новый snapshot.
             self._reset_undo_group()
             self.editor_edit(key, arrows=True)
             self.clamp_cursor()
@@ -2048,7 +2199,7 @@ class M:
             self.ed_buffer.insert(cy + 1, line[cx:])
             self.ed_cursor = [cy + 1, 0]
             self.ed_modified = True
-        elif key == 9:  # Tab
+        elif key == 9:
             line = self.ed_buffer[cy]
             ext = Path(self.ed_filename).suffix.lower() if self.ed_filename else ""
             insert = "\t" if ext in (".go", ".c", ".h", ".cpp", ".hpp") else "    "
@@ -2150,7 +2301,6 @@ class M:
         if not found:
             self.set_message("Не найдено.")
             return
-        # Явная операция — push + reset (уже внутри _push_undo)
         self._push_undo()
         count = 0
         for i, line in enumerate(self.ed_buffer):
@@ -2197,8 +2347,6 @@ class M:
 
     # ==================== ФЛАГИ КОМАНДНОЙ СТРОКИ ====================
     def apply_flags(self, args):
-        """Обрабатывает только -e/--edit. Остальные CLI-флаги
-        (-h/-m/-i/-c/-v) перехватываются в main() до curses.wrapper."""
         flag = args[0]
         if flag in ("-e", "--edit"):
             if len(args) > 1:
@@ -2244,7 +2392,7 @@ def _print_cli_help():
   M -v, --version  версия
 
 Горячие клавиши внутри M — нажми '?' в файловом менеджере
-или F1/Ctrl+P в редакторе.""")
+или F1/Ctrl+P в редакторе. Мышью — клик по строке.""")
 
 
 def main():
@@ -2253,7 +2401,6 @@ def main():
 
     ensure_directories()
 
-    # ---------------- CLI-режимы (без curses) ----------------
     if flag in ("-h", "--help"):
         _print_cli_help()
         return
@@ -2298,17 +2445,15 @@ def main():
             sys.exit(1)
         return
     if flag in ("-v", "--version"):
-        print("M v6.1")
+        print("M v6.2")
         return
 
-    # Неизвестный флаг — ошибка
     if flag and flag.startswith("-") and flag not in ("-e", "--edit"):
         print(f"Неизвестный флаг: {flag}", file=sys.stderr)
         print(file=sys.stderr)
         _print_cli_help()
         sys.exit(1)
 
-    # ---------------- Интерактивный режим ----------------
     try:
         import locale
         locale.setlocale(locale.LC_ALL, '')
