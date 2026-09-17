@@ -33,7 +33,7 @@
 
 ```bash
 pkg update && pkg install python git
-git clone https://github.com/ShiMukanshin/m.git
+git clone https://github.com/ShiMukanshin/m-termux.git
 cd m
 chmod +x m.py
 ~/m.py
