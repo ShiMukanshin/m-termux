@@ -2,31 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.6 — стабильность ввода, мелкая UX-правка.
+Версия 6.5.7.
 
-Изменения относительно 6.5.5:
-  • editor_open_file("") теперь возвращает True — пустой путь в
-    Ctrl+O оставляет промпт открытым, чтобы пользователь мог
-    ввести путь заново или отменить по Esc. Раньше промпт молча
-    закрывался без какой-либо обратной связи.
-
-Базовые изменения 6.5.5 (сохранены):
-  • Модальные экраны переживают KEY_RESIZE (перерисовка через main loop).
-  • new_tab использует cwd активной панели.
-  • _prompt_delete: явное сообщение для '..'.
-  • Убраны мёртвые ветки KEY_RESIZE в handle_editor_key/handle_files_key.
-
-Базовые изменения 6.5.4 (сохранены):
-  • KEY_RESIZE в главном цикле обрабатывается раньше промпта.
-  • do_copy/do_move применяют HOOK_TIMEOUT_BATCH при массовых операциях.
-  • _trash_restore подбирает уникальный суффикс _restored1..100.
-
-Базовые изменения 6.5.3 (сохранены):
-  • Enter в редакторе принимает curses.KEY_ENTER.
-  • atomic_write_text сохраняет права существующего файла.
-  • editor_open_file отвергает FIFO, /dev/*, сокеты.
-  • do_mkdir: «уже существует» — отдельное сообщение.
-  • HookManager.fire принимает timeout=.
+Изменения относительно 6.5.6:
+  • do_rename переносит отметку со старого пути на новый — после
+    переименования помеченного файла следующая d/c/i не падает.
+  • editor_open_file на пустом вводе ставит сообщение и оставляет
+    промпт открытым.
+  • _prompt_delete различает entry is None и entry.is_parent.
+  • run() в try/finally: save_config() вызывается и при Ctrl+C
+    в модальных экранах.
+  • _close_prompt сбрасывает prompt_text.
 """
 
 import curses
@@ -46,10 +32,9 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.6"
+__version__ = "6.5.7"
 
 
-# ============================ ПУТИ ============================
 HOME = Path.home()
 CONFIG_DIR = HOME / ".m"
 HOOKS_DIR = CONFIG_DIR / "hooks"
@@ -62,27 +47,21 @@ TRASH_META = TRASH_DIR / ".meta.json"
 HOOKS_LOG = LOGS_DIR / "hooks.log"
 
 ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz")
-
 ARCHIVE_EXTS_SET = (".gz", ".bz2", ".xz", ".zst", ".lz", ".lzma",
                     ".7z", ".rar", ".z")
-
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
              ".h", ".hpp", ".java", ".rb", ".php", ".lua")
 SCRIPT_EXTS = (".sh", ".bash", ".zsh", ".fish", ".ps1")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico")
 
 TABSTOP = 8
-
-MAX_EDITOR_FILE = 10 * 1024 * 1024  # 10 MB
-HOOK_TIMEOUT = 2.0          # секунд, для одиночных событий
-HOOK_TIMEOUT_BATCH = 0.3    # секунд на файл при батче
+MAX_EDITOR_FILE = 10 * 1024 * 1024
+HOOK_TIMEOUT = 2.0
+HOOK_TIMEOUT_BATCH = 0.3
 TRASH_SAVE_EVERY = 10
 
-# Единица списка панели
 _Entry = namedtuple("_Entry", ["path", "name", "is_dir", "is_parent"])
 
-# Опасные префиксы для восстановления из корзины.
-# '/data' НЕ входит — там живёт Termux home.
 _DANGEROUS_RESTORE_PREFIXES = {
     "/etc", "/bin", "/sbin", "/boot", "/root",
     "/lib", "/lib64", "/usr/bin", "/usr/sbin", "/usr/lib",
@@ -91,12 +70,7 @@ _DANGEROUS_RESTORE_PREFIXES = {
 }
 
 
-# ============================ АТОМАРНАЯ ЗАПИСЬ ============================
 def atomic_write_text(path, text, encoding="utf-8"):
-    """
-    Атомарная запись текста: tmp-файл рядом с целевым + os.replace.
-    Сохраняет права существующего целевого файла.
-    """
     path = Path(path)
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,7 +108,6 @@ def atomic_write_text(path, text, encoding="utf-8"):
         raise
 
 
-# ============================ АВТОСОЗДАНИЕ СТРУКТУРЫ ============================
 def ensure_directories():
     for d in (CONFIG_DIR, HOOKS_DIR, LOGS_DIR, BACKUP_DIR, TRASH_DIR):
         try:
@@ -143,10 +116,7 @@ def ensure_directories():
             pass
 
 
-# ============================ ХУКИ ============================
 class HookManager:
-    """Загружает ~/.m/hooks/*.py, вызывает EVENTS[event](**kwargs)."""
-
     TIMEOUT_EVENTS = {
         "on_start", "on_open", "on_save",
         "on_create", "on_move", "on_delete",
@@ -223,11 +193,6 @@ class HookManager:
         return result[0]
 
     def fire(self, event, timeout=None, **kwargs):
-        """
-        Событие-действие. Для TIMEOUT_EVENTS — с таймаутом.
-        timeout= переопределяет HOOK_TIMEOUT на один вызов.
-        Параметр `timeout` перехватывается и в хук не передаётся.
-        """
         timed = event in self.TIMEOUT_EVENTS
         actual_timeout = HOOK_TIMEOUT if timeout is None else timeout
         for name, fn in self.hooks.get(event, []):
@@ -246,7 +211,6 @@ class HookManager:
 
 
 class NullHookManager:
-    """Заглушка для --safe."""
     def __init__(self):
         self.hooks = {}
         self.loaded = []
@@ -262,7 +226,6 @@ class NullHookManager:
         return []
 
 
-# ============================ UNDO ============================
 class UndoManager:
     def __init__(self, max_size=100):
         self.undo_stack = deque(maxlen=max_size)
@@ -295,7 +258,6 @@ class UndoManager:
             return f"Ошибка повтора: {e}"
 
 
-# ============================ ОСНОВНОЙ КЛАСС ============================
 class M:
     MODE_FILES = "files"
     MODE_EDITOR = "editor"
@@ -352,7 +314,6 @@ class M:
 
         self._last_edit_time = 0.0
         self._last_edit_kind = None
-
         self._last_click_time = 0.0
         self._last_click_pos = (-1, -1)
 
@@ -373,7 +334,6 @@ class M:
         self.refresh_pane(0)
         self.refresh_pane(1)
 
-    # ==================== КОНФИГ / ЗАКЛАДКИ ====================
     def load_config(self):
         try:
             if CONFIG_FILE.exists():
@@ -411,7 +371,6 @@ class M:
         except Exception:
             pass
 
-    # ==================== ЦВЕТА ====================
     def init_colors(self):
         if self.no_color:
             return
@@ -457,7 +416,6 @@ class M:
         except Exception:
             return extra
 
-    # ==================== МЫШЬ ====================
     def _init_mouse(self):
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
@@ -493,7 +451,6 @@ class M:
             self._mouse_files(mx, my, is_double)
 
     def _mouse_scroll(self, delta):
-        """delta < 0 — вверх, delta > 0 — вниз. 1 строка за тик."""
         if self.mode == self.MODE_EDITOR:
             key = curses.KEY_UP if delta < 0 else curses.KEY_DOWN
             for _ in range(abs(delta)):
@@ -567,7 +524,6 @@ class M:
         self.clamp_cursor()
         self._reset_undo_group()
 
-    # ==================== ВВОД ====================
     def _get_key(self):
         ch = None
         try:
@@ -653,7 +609,6 @@ class M:
         table[len(line)] = col
         return table
 
-    # ==================== ПАНЕЛИ ====================
     def refresh_pane(self, idx):
         base = self.panes[idx]
         entries = [_Entry(base.parent, "..", True, True)]
@@ -688,7 +643,6 @@ class M:
             return self.items[idx][self.selected[idx]]
         return None
 
-    # ==================== ВЫВОД ====================
     def addstr(self, y, x, text, attr=0):
         try:
             h, w = self.stdscr.getmaxyx()
@@ -734,7 +688,6 @@ class M:
     def set_message(self, msg):
         self.message = msg
 
-    # ==================== ЦВЕТ ФАЙЛА ПО РАСШИРЕНИЮ ====================
     def _is_archive_name(self, name):
         n = name.lower()
         return (any(n.endswith(e) for e in ARCHIVE_EXTS)
@@ -754,7 +707,6 @@ class M:
             return self.cp(6)
         return curses.A_NORMAL
 
-    # ==================== ОТРИСОВКА ПРОМПТА ====================
     def _draw_prompt(self, h, w):
         if self.prompt_yesno:
             prompt_line = f" {self.prompt_text}"
@@ -775,7 +727,6 @@ class M:
                 vcol = self._visual_col(prompt_line, len(prompt_line))
                 self.move_cursor(h - 1, min(vcol, w - 2))
 
-    # ==================== ОТРИСОВКА: ФАЙЛЫ ====================
     def draw_files(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -845,7 +796,6 @@ class M:
             prefix = ">" if j == sel else " "
             self.addstr(2 + row, x0, f"{prefix}{mark} {name}", attr)
 
-    # ==================== ОТРИСОВКА: РЕДАКТОР ====================
     def draw_editor(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1035,7 +985,6 @@ class M:
         if pos < len(line) and pad_cp is None:
             self.addstr(y, col(pos), line[pos:], curses.A_NORMAL)
 
-    # ==================== СПРАВКА ====================
     def draw_help(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1146,7 +1095,6 @@ class M:
             return
         self.mode = self.MODE_EDITOR
 
-    # ==================== ХУКИ ====================
     def draw_hooks(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1193,7 +1141,6 @@ class M:
             self.set_message("Хуки перезагружены.")
         self.mode = self.MODE_FILES
 
-    # ==================== ДАШБОРД ====================
     def draw_dashboard(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1278,7 +1225,6 @@ class M:
             return
         self.mode = self.MODE_FILES
 
-    # ==================== ЗАКЛАДКИ ====================
     def draw_bookmarks(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1332,7 +1278,6 @@ class M:
             if self.bm_idx >= len(self.bookmarks):
                 self.bm_idx = max(0, len(self.bookmarks) - 1)
 
-    # ==================== КОРЗИНА ====================
     def draw_trash(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1505,7 +1450,6 @@ class M:
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
 
-    # ==================== АРХИВ ====================
     def draw_archive(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -1629,86 +1573,86 @@ class M:
         self.refresh_pane(self.active)
         self.mode = self.MODE_FILES
 
-    # ==================== ГЛАВНЫЙ ЦИКЛ ====================
     def run(self):
         ensure_directories()
         self.hooks.fire("on_start", cwd=str(self.panes[self.active]))
-        while self.running:
-            try:
-                if self.mode == self.MODE_FILES:
-                    self.draw_files()
-                elif self.mode == self.MODE_EDITOR:
-                    self.draw_editor()
-                elif self.mode == self.MODE_HELP:
-                    self.draw_help()
-                    continue
-                elif self.mode == self.MODE_HELP_EDITOR:
-                    self.draw_help_editor()
-                    continue
-                elif self.mode == self.MODE_HOOKS:
-                    self.draw_hooks()
-                    continue
-                elif self.mode == self.MODE_DASHBOARD:
-                    self.draw_dashboard()
-                    continue
-                elif self.mode == self.MODE_BOOKMARKS:
-                    self.draw_bookmarks()
-                    continue
-                elif self.mode == self.MODE_TRASH:
-                    self.draw_trash()
-                    continue
-                elif self.mode == self.MODE_ARCHIVE:
-                    self.draw_archive()
-                    continue
-            except curses.error:
-                pass
-            except Exception as e:
+        try:
+            while self.running:
                 try:
-                    self.set_message(f"Ошибка отрисовки: {e}")
-                except Exception:
+                    if self.mode == self.MODE_FILES:
+                        self.draw_files()
+                    elif self.mode == self.MODE_EDITOR:
+                        self.draw_editor()
+                    elif self.mode == self.MODE_HELP:
+                        self.draw_help()
+                        continue
+                    elif self.mode == self.MODE_HELP_EDITOR:
+                        self.draw_help_editor()
+                        continue
+                    elif self.mode == self.MODE_HOOKS:
+                        self.draw_hooks()
+                        continue
+                    elif self.mode == self.MODE_DASHBOARD:
+                        self.draw_dashboard()
+                        continue
+                    elif self.mode == self.MODE_BOOKMARKS:
+                        self.draw_bookmarks()
+                        continue
+                    elif self.mode == self.MODE_TRASH:
+                        self.draw_trash()
+                        continue
+                    elif self.mode == self.MODE_ARCHIVE:
+                        self.draw_archive()
+                        continue
+                except curses.error:
                     pass
+                except Exception as e:
+                    try:
+                        self.set_message(f"Ошибка отрисовки: {e}")
+                    except Exception:
+                        pass
 
-            try:
-                key = self._get_key()
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                continue
+                try:
+                    key = self._get_key()
+                except KeyboardInterrupt:
+                    break
+                except Exception:
+                    continue
 
-            if key == -1:
-                time.sleep(0.02)
-                continue
+                if key == -1:
+                    time.sleep(0.02)
+                    continue
 
-            if key == curses.KEY_MOUSE:
-                self._handle_mouse()
-                continue
+                if key == curses.KEY_MOUSE:
+                    self._handle_mouse()
+                    continue
 
-            if key == curses.KEY_RESIZE:
-                self._init_mouse()
-                if self.mode == self.MODE_FILES:
-                    self.refresh_pane(0)
-                    self.refresh_pane(1)
-                continue
+                if key == curses.KEY_RESIZE:
+                    self._init_mouse()
+                    if self.mode == self.MODE_FILES:
+                        self.refresh_pane(0)
+                        self.refresh_pane(1)
+                    continue
 
-            if self.prompt_active:
-                self.handle_prompt_key(key)
-                continue
+                if self.prompt_active:
+                    self.handle_prompt_key(key)
+                    continue
 
-            try:
-                if self.mode == self.MODE_FILES:
-                    self.handle_files_key(key)
-                elif self.mode == self.MODE_EDITOR:
-                    self.handle_editor_key(key)
-            except Exception as e:
-                self.set_message(f"Ошибка: {e}")
+                try:
+                    if self.mode == self.MODE_FILES:
+                        self.handle_files_key(key)
+                    elif self.mode == self.MODE_EDITOR:
+                        self.handle_editor_key(key)
+                except Exception as e:
+                    self.set_message(f"Ошибка: {e}")
+        finally:
+            self.save_config()
 
-        self.save_config()
-
-    # ==================== ПРОМПТ ====================
     def _close_prompt(self):
         self.prompt_active = False
         self.prompt_yesno = False
         self.prompt_callback = None
+        self.prompt_text = ""
         self.prompt_input = ""
 
     def ask(self, text, callback):
@@ -1720,7 +1664,6 @@ class M:
         self.message = ""
 
     def ask_yesno(self, text, callback):
-        """Модальный y/n. Callback получает 'y' или 'n'."""
         self.prompt_active = True
         self.prompt_yesno = True
         self.prompt_text = text
@@ -1786,7 +1729,6 @@ class M:
         elif isinstance(key, int) and 32 <= key <= 126:
             self.prompt_input += chr(key)
 
-    # ==================== ФАЙЛЫ ====================
     def handle_files_key(self, key):
         idx = self.active
 
@@ -1874,13 +1816,15 @@ class M:
             self.mode = self.MODE_HELP
 
     def _prompt_delete(self):
-        """Формирует промпт удаления с учётом отметок."""
         if self.marked[self.active]:
             n = len(self.marked[self.active])
             text = f"Удалить в корзину: {n} шт.? [y/д, n/н]: "
         else:
             entry = self.current_item()
-            if entry is None or entry.is_parent:
+            if entry is None:
+                self.set_message("Нечего удалять (панель пуста).")
+                return
+            if entry.is_parent:
                 self.set_message("Нечего удалять (курсор на '..').")
                 return
             text = f"Удалить '{entry.name}' в корзину? [y/д, n/н]: "
@@ -1933,7 +1877,6 @@ class M:
         if not self.editor_open_file(str(full)):
             self.mode = self.MODE_EDITOR
 
-    # ==================== ФАЙЛОВЫЕ ОПЕРАЦИИ ====================
     def do_mkdir(self, name):
         name = name.strip()
         if not name:
@@ -2012,6 +1955,11 @@ class M:
             self.refresh_pane(self.active)
             self.hooks.fire("on_move", src=str(src), dst=str(dst))
 
+            old_s, new_s = str(src), str(dst)
+            if old_s in self.marked[self.active]:
+                self.marked[self.active].discard(old_s)
+                self.marked[self.active].add(new_s)
+
             def undo():
                 if dst.exists() and not src.exists():
                     dst.rename(src)
@@ -2030,11 +1978,6 @@ class M:
             self.set_message(f"Ошибка: {e}")
 
     def do_delete(self, answer):
-        """
-        Массовое удаление с учётом отметок.
-        Meta сохраняется каждые TRASH_SAVE_EVERY; undo/redo — в finally.
-        Хуки: on_delete вызывается на каждый файл, в батче с коротким таймаутом.
-        """
         if answer != 'y':
             self.set_message("Отменено.")
             return
@@ -2297,7 +2240,6 @@ class M:
             self.set_message(f"Закладка: {current}")
         self.save_bookmarks()
 
-    # ==================== ВКЛАДКИ ====================
     def _save_tab_state(self):
         self.tabs[self.active_tab]["panes"] = list(self.panes)
         self.tabs[self.active_tab]["selected"] = list(self.selected)
@@ -2321,8 +2263,6 @@ class M:
 
     def new_tab(self):
         self._save_tab_state()
-        # Новая вкладка открывается в текущем каталоге активной панели,
-        # а не в Path.cwd() процесса (который за время работы не менялся).
         cwd = self.panes[self.active]
         self.tabs.append({
             "panes": [cwd, cwd],
@@ -2357,7 +2297,6 @@ class M:
         self.refresh_pane(1)
         self.set_message("Вкладка закрыта.")
 
-    # ==================== РЕДАКТОР ====================
     def _snapshot(self):
         return (list(self.ed_buffer), list(self.ed_cursor), self.ed_modified)
 
@@ -2408,7 +2347,6 @@ class M:
             self.set_message("Нечего повторять.")
 
     def save_editor(self):
-        """Атомарное сохранение. Round-trip переводов строк."""
         if not self.ed_filename:
             self.set_message("Нет имени файла. Используйте Ctrl+O.")
             return False
@@ -2682,17 +2620,11 @@ class M:
         self.set_message(f"Заменено вхождений: {count} (Ctrl+Z — отменить)")
 
     def editor_open_file(self, path):
-        """
-        Открывает файл.
-        True — ошибка или пустой путь (промпт остаётся открытым),
-        False — успех.
-        """
         if path is None:
             return True
         path = path.strip()
         if not path:
-            # Пустой ввод — оставляем промпт открытым, чтобы пользователь
-            # мог ввести путь заново или отменить по Esc.
+            self.set_message("Пусто — Esc для отмены.")
             return True
         try:
             p = Path(path).expanduser()
@@ -2755,7 +2687,6 @@ class M:
             self.set_message(f"Ошибка: {e}")
             return True
 
-    # ==================== ФЛАГИ КОМАНДНОЙ СТРОКИ ====================
     def apply_flags(self, args):
         if not args:
             return
@@ -2770,7 +2701,6 @@ class M:
                 self.mode = self.MODE_EDITOR
 
 
-# ============================ ТОЧКА ВХОДА ============================
 def _run_curses(stdscr, safe=False, no_color=False, args=None):
     try:
         curses.curs_set(1)
@@ -2804,11 +2734,10 @@ def _print_cli_help():
   M -v, --version  версия
 
 Опции:
-  --safe           отключить хуки (для отладки / безопасности)
+  --safe           отключить хуки
   --no-color       монохромный режим
 
-Горячие клавиши внутри M — нажми '?' в файловом менеджере
-или F1/Ctrl+P в редакторе. Мышью — клик по строке.""")
+Справка внутри M — '?' в файловом менеджере, F1 в редакторе.""")
 
 
 def main():
