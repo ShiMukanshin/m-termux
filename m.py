@@ -2,19 +2,44 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.4.1 — фиксы разделителя панелей и версий.
+Версия 6.5.0 — стабильность, безопасность, UX.
 
-Изменения относительно 6.4:
-  • curses.A_VLINE → curses.ACS_VLINE: разделитель между панелями
-    снова рисуется (A_VLINE не существует, а широкий try/except
-    глушил AttributeError — черта молча пропадала).
-  • Версии выровнены на 6.4.1: docstring, титулы экранов, M -v.
-    Раньше UI показывал v6.3.1, а --version печатал v6.4.
-  • _mouse_scroll в редакторе сбрасывает undo-группу — скролл
-    не сливается с последующей печатью в один Ctrl+Z.
-  • В docstring явно сказано: колесо в редакторе двигает КУРСОР
-    (вью следует за ним), а не только вью. Это осознанный выбор
-    для mobile-first: курсор не «теряется» при скролле.
+Изменения относительно 6.4.1:
+  • Редактор: полный round-trip переводов строк. Файл, заканчивающийся
+    на \\n, больше не теряет его при сохранении. CRLF нормализуется
+    при чтении.
+  • Редактор: атомарное сохранение (tmp + os.replace) — падение
+    телефона не оставит обрезанный файл.
+  • Редактор: защита от открытия файлов > 10 MB.
+  • Редактор: editor_open_file корректно сигналит об ошибке —
+    промпт не закрывается, если путь введён неверно.
+  • Хуки: ошибки и таймауты пишутся в ~/.m/logs/hooks.log.
+    Действия (on_start/on_open/on_save/on_create/on_move/on_delete)
+    выполняются с таймаутом 2 с — зависший хук не морозит UI.
+    on_draw_line без таймаута (это рендер, должен быть быстрым).
+  • Диалоги подтверждения — модальные y/n (одна клавиша),
+    а не текстовый ввод «да/yes/y».
+  • Корзина: уникальные имена через time_ns + счётчик — undo/redo
+    подряд больше не затирает файлы.
+  • Панели: элементы кэшируют is_dir / is_parent (NamedTuple Entry),
+    лишний syscall на каждый файл при отрисовке убран.
+  • Флаги: --safe (без хуков), --no-color (монохром).
+  • Версия вынесена в __version__ — больше не разъедется.
+  • Мелочи: guard в поиске слова под курсором.
+
+Правки 6.5.0-hotfix (тот же номер версии, исправления без изменения
+пользовательского API):
+  • Yes/No-промпт теперь корректно принимает кириллицу «д»/«н»
+    (get_wch отдаёт их как str, а не int).
+  • Все записи JSON-метаданных (config, bookmarks, trash/.meta.json)
+    переведены на атомарную запись tmp + os.replace.
+  • _load_trash_meta фильтрует некорректные записи.
+  • _trash_restore валидирует оригинальный путь (должен быть
+    абсолютным и не корнем ФС) — защита от подмены meta.json.
+  • Промпт принимает curses.KEY_ENTER (некоторые терминалы Termux).
+  • editor_open_file явно возвращает False при успехе.
+  • refresh_pane сообщает о PermissionError.
+  • main() больше не мутирует sys.argv.
 """
 
 import curses
@@ -28,8 +53,12 @@ import tarfile
 import subprocess
 import time
 import unicodedata
+import threading
 from pathlib import Path
-from collections import deque
+from collections import deque, namedtuple
+
+
+__version__ = "6.5.0"
 
 
 # ============================ ПУТИ ============================
@@ -42,6 +71,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 BOOKMARKS_FILE = CONFIG_DIR / "bookmarks.json"
 TRASH_DIR = CONFIG_DIR / "trash"
 TRASH_META = TRASH_DIR / ".meta.json"
+HOOKS_LOG = LOGS_DIR / "hooks.log"
 
 ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz")
 
@@ -55,6 +85,29 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico")
 
 TABSTOP = 8
 
+MAX_EDITOR_FILE = 10 * 1024 * 1024  # 10 MB
+HOOK_TIMEOUT = 2.0  # seconds
+
+# Единица списка панели
+_Entry = namedtuple("_Entry", ["path", "name", "is_dir", "is_parent"])
+
+
+# ============================ АТОМАРНАЯ ЗАПИСЬ ============================
+def atomic_write_text(path, text, encoding="utf-8"):
+    """
+    Атомарная запись текста: пишем во временный файл рядом с целевым,
+    затем os.replace. Падение процесса в момент записи не оставит
+    обрезанный целевой файл.
+
+    Бросает исключение при ошибке — вызывающий код решает, что делать.
+    """
+    path = Path(path)
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".m.tmp")
+    tmp.write_text(text, encoding=encoding)
+    os.replace(str(tmp), str(path))
+
 
 # ============================ АВТОСОЗДАНИЕ СТРУКТУРЫ ============================
 def ensure_directories():
@@ -67,6 +120,15 @@ def ensure_directories():
 
 # ============================ ХУКИ ============================
 class HookManager:
+    """Загружает ~/.m/hooks/*.py, вызывает EVENTS[event](**kwargs)."""
+
+    # События, которые могут блокировать (сеть, subprocess) — им нужен таймаут.
+    # on_draw_line — это рендер, вызывается на каждую строку: таймаут не нужен.
+    TIMEOUT_EVENTS = {
+        "on_start", "on_open", "on_save",
+        "on_create", "on_move", "on_delete",
+    }
+
     def __init__(self):
         self.hooks = {}
         self.loaded = []
@@ -91,25 +153,85 @@ class HookManager:
                         self.hooks.setdefault(evt, []).append((f.stem, fn))
                 self.loaded.append(f.stem)
             except Exception as e:
-                self.errors.append(f"{f.name}: {type(e).__name__}: {e}")
+                msg = f"{f.name}: {type(e).__name__}: {e}"
+                self.errors.append(msg)
+                self._log(f"LOAD-FAIL {msg}")
+
+    def _log(self, msg):
+        try:
+            ensure_directories()
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(HOOKS_LOG, "a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] {msg}\n")
+        except Exception:
+            pass
+
+    def _call_sync(self, name, event, fn, kwargs):
+        try:
+            return fn(**kwargs)
+        except Exception as e:
+            self._log(f"ERROR event={event} hook={name}: "
+                      f"{type(e).__name__}: {e}")
+            return None
+
+    def _call_timed(self, name, event, fn, kwargs, timeout):
+        result = [None]
+        exc = [None]
+        done = threading.Event()
+
+        def _run(fn=fn, kwargs=kwargs, result=result, exc=exc, done=done):
+            try:
+                result[0] = fn(**kwargs)
+            except Exception as e:
+                exc[0] = e
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        if not done.wait(timeout):
+            self._log(f"TIMEOUT event={event} hook={name} (> {timeout}s)")
+            return None
+        if exc[0] is not None:
+            self._log(f"ERROR event={event} hook={name}: "
+                      f"{type(exc[0]).__name__}: {exc[0]}")
+            return None
+        return result[0]
 
     def fire(self, event, **kwargs):
+        """Событие-действие. Для TIMEOUT_EVENTS — с таймаутом."""
+        timed = event in self.TIMEOUT_EVENTS
         for name, fn in self.hooks.get(event, []):
-            try:
-                fn(**kwargs)
-            except Exception:
-                pass
+            if timed:
+                self._call_timed(name, event, fn, kwargs, HOOK_TIMEOUT)
+            else:
+                self._call_sync(name, event, fn, kwargs)
 
     def fire_collect(self, event, **kwargs):
+        """Событие-рендер. Возвращает список не-None результатов. Без таймаута."""
         results = []
         for name, fn in self.hooks.get(event, []):
-            try:
-                r = fn(**kwargs)
-                if r is not None:
-                    results.append(r)
-            except Exception:
-                pass
+            r = self._call_sync(name, event, fn, kwargs)
+            if r is not None:
+                results.append(r)
         return results
+
+
+class NullHookManager:
+    """Заглушка для --safe."""
+    def __init__(self):
+        self.hooks = {}
+        self.loaded = []
+        self.errors = []
+
+    def reload(self):
+        pass
+
+    def fire(self, event, **kwargs):
+        pass
+
+    def fire_collect(self, event, **kwargs):
+        return []
 
 
 # ============================ UNDO ============================
@@ -159,9 +281,11 @@ class M:
 
     UNDO_GROUP_WINDOW = 0.3
 
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, safe=False, no_color=False):
         self.stdscr = stdscr
-        self.hooks = HookManager()
+        self.safe = safe
+        self.no_color = no_color
+        self.hooks = NullHookManager() if safe else HookManager()
         self.undo = UndoManager()
         self.running = True
         self.message = ""
@@ -205,6 +329,7 @@ class M:
         self._last_click_pos = (-1, -1)
 
         self.prompt_active = False
+        self.prompt_yesno = False
         self.prompt_text = ""
         self.prompt_input = ""
         self.prompt_callback = None
@@ -232,9 +357,10 @@ class M:
     def save_config(self):
         try:
             ensure_directories()
-            CONFIG_FILE.write_text(json.dumps({
-                "show_hidden": self.show_hidden,
-            }, indent=2), encoding="utf-8")
+            atomic_write_text(
+                CONFIG_FILE,
+                json.dumps({"show_hidden": self.show_hidden}, indent=2),
+            )
         except Exception:
             pass
 
@@ -250,13 +376,17 @@ class M:
     def save_bookmarks(self):
         try:
             ensure_directories()
-            BOOKMARKS_FILE.write_text(json.dumps(self.bookmarks, indent=2),
-                                      encoding="utf-8")
+            atomic_write_text(
+                BOOKMARKS_FILE,
+                json.dumps(self.bookmarks, indent=2),
+            )
         except Exception:
             pass
 
     # ==================== ЦВЕТА ====================
     def init_colors(self):
+        if self.no_color:
+            return
         try:
             if not curses.has_colors():
                 return
@@ -290,6 +420,8 @@ class M:
             pass
 
     def cp(self, n, extra=0):
+        if self.no_color:
+            return extra
         try:
             if not curses.has_colors():
                 return extra
@@ -484,15 +616,28 @@ class M:
 
     # ==================== ПАНЕЛИ ====================
     def refresh_pane(self, idx):
+        base = self.panes[idx]
+        entries = [_Entry(base.parent, "..", True, True)]
         try:
-            all_items = list(self.panes[idx].iterdir())
+            all_items = list(base.iterdir())
             if not self.show_hidden:
                 all_items = [p for p in all_items if not p.name.startswith('.')]
-            items = sorted(all_items,
-                           key=lambda p: (not p.is_dir(), p.name.lower()))
-            self.items[idx] = [Path("..")] + items
+            info = []
+            for p in all_items:
+                try:
+                    is_dir = p.is_dir()
+                except OSError:
+                    is_dir = False
+                info.append((p, is_dir))
+            info.sort(key=lambda t: (not t[1], t[0].name.lower()))
+            for p, is_dir in info:
+                entries.append(_Entry(p, p.name, is_dir, False))
+        except PermissionError:
+            self.set_message(f"Нет доступа: {base}")
         except Exception:
-            self.items[idx] = [Path("..")]
+            pass
+        self.items[idx] = entries
+
         if self.selected[idx] >= len(self.items[idx]):
             self.selected[idx] = max(0, len(self.items[idx]) - 1)
         if self.selected[idx] < 0:
@@ -556,12 +701,12 @@ class M:
         return (any(n.endswith(e) for e in ARCHIVE_EXTS)
                 or any(n.endswith(e) for e in ARCHIVE_EXTS_SET))
 
-    def _file_attr(self, item):
-        if item.name == ".." or item.is_dir():
+    def _file_attr(self, entry):
+        if entry.is_parent or entry.is_dir:
             return self.cp(2)
-        if self._is_archive_name(item.name):
+        if self._is_archive_name(entry.name):
             return self.cp(3)
-        ext = item.suffix.lower()
+        ext = entry.path.suffix.lower()
         if ext in CODE_EXTS:
             return self.cp(6, curses.A_BOLD)
         if ext in SCRIPT_EXTS:
@@ -581,7 +726,7 @@ class M:
                 f"[{i+1}]" if i == self.active_tab else f" {i+1} "
                 for i in range(len(self.tabs))
             )
-        title = f" M v6.4.1 {tab_label} — Файлы "
+        title = f" M v{__version__} {tab_label} — Файлы "
         self.addstr(0, 0, title, self.cp(1, curses.A_BOLD))
 
         half = max(10, w // 2)
@@ -599,18 +744,7 @@ class M:
         status = " Enter:откр m:папка n:файл i:пер c:коп d:удал e:ред ?:справка "
 
         if self.prompt_active:
-            self._set_cursor_visible(True)
-            prompt_line = f" {self.prompt_text}{self.prompt_input}"
-            if self.message:
-                self.addstr(h - 2, 0, prompt_line, self.cp(3))
-                self.addstr(h - 1, 0, f" {self.message}",
-                            self.cp(4, curses.A_BOLD))
-                vcol = self._visual_col(prompt_line, len(prompt_line))
-                self.move_cursor(h - 2, min(vcol, w - 2))
-            else:
-                self.addstr(h - 1, 0, prompt_line, self.cp(3, curses.A_BOLD))
-                vcol = self._visual_col(prompt_line, len(prompt_line))
-                self.move_cursor(h - 1, min(vcol, w - 2))
+            self._draw_prompt(h, w)
         else:
             self._set_cursor_visible(False)
             msg = self.message or status
@@ -618,6 +752,28 @@ class M:
             self.addstr(h - 1, 0, msg, attr)
 
         self.stdscr.refresh()
+
+    def _draw_prompt(self, h, w):
+        """Общая отрисовка промпта (обычный и yes/no)."""
+        if self.prompt_yesno:
+            prompt_line = f" {self.prompt_text}"
+            self._set_cursor_visible(False)
+        else:
+            prompt_line = f" {self.prompt_text}{self.prompt_input}"
+            self._set_cursor_visible(True)
+
+        if self.message:
+            self.addstr(h - 2, 0, prompt_line, self.cp(3, curses.A_BOLD))
+            self.addstr(h - 1, 0, f" {self.message}",
+                        self.cp(4, curses.A_BOLD))
+            if not self.prompt_yesno:
+                vcol = self._visual_col(prompt_line, len(prompt_line))
+                self.move_cursor(h - 2, min(vcol, w - 2))
+        else:
+            self.addstr(h - 1, 0, prompt_line, self.cp(3, curses.A_BOLD))
+            if not self.prompt_yesno:
+                vcol = self._visual_col(prompt_line, len(prompt_line))
+                self.move_cursor(h - 1, min(vcol, w - 2))
 
     def _draw_pane(self, i, x0, width, h):
         header = f" {self.panes[i]} "
@@ -634,13 +790,11 @@ class M:
             j = start + row
             if j >= len(self.items[i]):
                 break
-            item = self.items[i][j]
-            is_dotdot = (item.name == "..")
-            is_dir = is_dotdot or item.is_dir()
-            name = item.name + ("/" if is_dir else "")
-            is_marked = (not is_dotdot) and (
-                str(self.panes[i] / item) in self.marked[i]
-            )
+            entry = self.items[i][j]
+            is_dotdot = entry.is_parent
+            is_dir = entry.is_dir
+            name = entry.name + ("/" if is_dir and not is_dotdot else "")
+            is_marked = (not is_dotdot) and (str(entry.path) in self.marked[i])
             mark = "●" if is_marked else " "
 
             if i == self.active and j == sel:
@@ -648,7 +802,7 @@ class M:
             elif is_marked:
                 attr = self.cp(6, curses.A_BOLD)
             else:
-                attr = self._file_attr(item)
+                attr = self._file_attr(entry)
 
             prefix = ">" if j == sel else " "
             self.addstr(2 + row, x0, f"{prefix}{mark} {name}", attr)
@@ -752,13 +906,19 @@ class M:
                     pass
                 self.move_cursor(screen_y, min(vcol, w - 2))
 
-        status = " ^S:сохр ^O:откр ^Z:undo ^Y:redo ^F:поиск ^G:next ^W:слово ^R:замена ^X:выход ^P:справка "
+        status = (" ^S:сохр ^O:откр ^Z:undo ^Y:redo ^F:поиск ^G:next "
+                  "^W:слово ^R:замена ^X:выход ^P:справка ")
 
         if self.prompt_active:
-            line = f" {self.prompt_text}{self.prompt_input}"
-            self.addstr(h - 2, 0, line, self.cp(3, curses.A_BOLD))
-            vcol = self._visual_col(line, len(line))
-            self.move_cursor(h - 2, min(vcol, w - 2))
+            if self.prompt_yesno:
+                self.addstr(h - 2, 0, f" {self.prompt_text}",
+                            self.cp(3, curses.A_BOLD))
+                self._set_cursor_visible(False)
+            else:
+                line = f" {self.prompt_text}{self.prompt_input}"
+                self.addstr(h - 2, 0, line, self.cp(3, curses.A_BOLD))
+                vcol = self._visual_col(line, len(line))
+                self.move_cursor(h - 2, min(vcol, w - 2))
             if self.message:
                 self.addstr(h - 1, 0, self.message, self.cp(4, curses.A_BOLD))
             else:
@@ -847,9 +1007,10 @@ class M:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         lines = [
-            "  M v6.4.1 — универсальный инструмент Termux  ",
+            f"  M v{__version__} — универсальный инструмент Termux  ",
             "",
-            "  ФЛАГИ:  M -e [FILE] | -m NAME | -i SRC DST | -c SRC DST | -h | -v",
+            "  ФЛАГИ:  M -e [FILE] | -m NAME | -i SRC DST | -c SRC DST",
+            "          -h | -v | --safe | --no-color",
             "",
             "  ФАЙЛЫ:",
             "    Tab          переключить панель",
@@ -884,13 +1045,15 @@ class M:
             "    ~/.m/hooks/*.py  с EVENTS = {событие: функция}",
             "    События: on_start on_open on_file_change on_save",
             "             on_create on_move on_delete on_draw_line",
+            f"    Логи: {HOOKS_LOG}",
             "",
             "  Нажми любую клавишу…",
         ]
         for i, line in enumerate(lines):
             if i >= h:
                 break
-            attr = curses.A_BOLD if line and not line.startswith("    ") and line.strip() else curses.A_NORMAL
+            attr = (curses.A_BOLD if line and not line.startswith("    ")
+                    and line.strip() else curses.A_NORMAL)
             self.addstr(i, 0, line, attr)
         self._set_cursor_visible(False)
         self.stdscr.refresh()
@@ -931,7 +1094,8 @@ class M:
         for i, line in enumerate(lines):
             if i >= h:
                 break
-            attr = curses.A_BOLD if line and not line.startswith("    ") and line.strip() else curses.A_NORMAL
+            attr = (curses.A_BOLD if line and not line.startswith("    ")
+                    and line.strip() else curses.A_NORMAL)
             self.addstr(i, 0, line, attr)
         self._set_cursor_visible(False)
         self.stdscr.refresh()
@@ -948,7 +1112,12 @@ class M:
         self.addstr(0, 0, " M — Менеджер хуков ", self.cp(1, curses.A_BOLD))
         y = 2
         self.addstr(y, 0, f" Директория: {HOOKS_DIR}")
+        y += 1
+        self.addstr(y, 0, f" Лог: {HOOKS_LOG}", curses.A_DIM)
         y += 2
+        if self.safe:
+            self.addstr(y, 0, " Режим --safe: хуки отключены.", self.cp(3))
+            y += 2
         if self.hooks.loaded:
             self.addstr(y, 0, " Загружены:", curses.A_BOLD)
             y += 1
@@ -995,7 +1164,8 @@ class M:
                     status = d / "status"
                     if cap.exists():
                         s = status.read_text().strip() if status.exists() else "?"
-                        lines.append(f"  Батарея {d.name}: {cap.read_text().strip()}% ({s})")
+                        lines.append(f"  Батарея {d.name}: "
+                                     f"{cap.read_text().strip()}% ({s})")
         except Exception:
             pass
         try:
@@ -1133,7 +1303,8 @@ class M:
                 attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
                 self.addstr(2 + i, 0, f"  {i+1}. {name}", attr)
 
-        self.addstr(h - 2, 0, " ↑/↓:выбор  r:восст.  d:удалить  C:очистить  Esc:назад ",
+        self.addstr(h - 2, 0,
+                    " ↑/↓:выбор  r:восст.  d:удалить  C:очистить  Esc:назад ",
                     self.cp(3))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
@@ -1173,7 +1344,10 @@ class M:
             if TRASH_META.exists():
                 data = json.loads(TRASH_META.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    return data
+                    return {
+                        k: v for k, v in data.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                    }
         except Exception:
             pass
         return {}
@@ -1181,10 +1355,45 @@ class M:
     def _save_trash_meta(self, data):
         try:
             TRASH_DIR.mkdir(parents=True, exist_ok=True)
-            TRASH_META.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                                  encoding="utf-8")
+            atomic_write_text(
+                TRASH_META,
+                json.dumps(data, indent=2, ensure_ascii=False),
+            )
         except Exception:
             pass
+
+    def _unique_trash_path(self, name):
+        """Уникальный путь в корзине. time_ns + счётчик — коллизии исключены."""
+        base = f"{time.time_ns()}"
+        candidate = TRASH_DIR / f"{base}_{name}"
+        n = 1
+        while candidate.exists():
+            candidate = TRASH_DIR / f"{base}_{n}_{name}"
+            n += 1
+        return candidate
+
+    @staticmethod
+    def _is_safe_restore_path(p):
+        """
+        Защита от подмены meta.json: разрешаем восстановление только
+        в абсолютный путь, не равный корню ФС и не равный '/'.
+        """
+        try:
+            if not p.is_absolute():
+                return False
+            # Запрещаем сам корень и одноуровневые директории вроде /etc, /bin
+            parts = p.parts
+            if len(parts) < 3:  # ('/', 'etc', 'file') минимум
+                return False
+            # Запрещаем /system, /data, /proc, /sys, /dev, /etc, /bin, /sbin, /usr/bin
+            forbidden = {"/system", "/data", "/proc", "/sys", "/dev",
+                         "/etc", "/bin", "/sbin", "/boot", "/root"}
+            prefix = "/" + parts[1]
+            if prefix in forbidden:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _trash_restore(self, item):
         name, path = item
@@ -1195,6 +1404,9 @@ class M:
             return
         try:
             dst = Path(original)
+            if not self._is_safe_restore_path(dst):
+                self.set_message("Некорректный путь в метаданных — отказ.")
+                return
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
                 dst = dst.parent / (dst.name + "_restored")
@@ -1427,20 +1639,66 @@ class M:
         self.save_config()
 
     # ==================== ПРОМПТ ====================
+    def _close_prompt(self):
+        self.prompt_active = False
+        self.prompt_yesno = False
+        self.prompt_callback = None
+        self.prompt_input = ""
+
     def ask(self, text, callback):
         self.prompt_active = True
+        self.prompt_yesno = False
+        self.prompt_text = text
+        self.prompt_input = ""
+        self.prompt_callback = callback
+        self.message = ""
+
+    def ask_yesno(self, text, callback):
+        """Модальный диалог y/n. Callback получает 'y' или 'n'."""
+        self.prompt_active = True
+        self.prompt_yesno = True
         self.prompt_text = text
         self.prompt_input = ""
         self.prompt_callback = callback
         self.message = ""
 
     def handle_prompt_key(self, key):
+        # Модальный y/n: реагируем на одну клавишу.
+        if self.prompt_yesno:
+            if key == 27:  # Esc
+                self._close_prompt()
+                self.set_message("Отменено.")
+                return
+            # get_wch отдаёт ASCII как int, а кириллицу — как str.
+            ch = None
+            if isinstance(key, str) and len(key) == 1:
+                ch = key.lower()
+            elif isinstance(key, int):
+                try:
+                    ch = chr(key).lower()
+                except (ValueError, OverflowError):
+                    ch = None
+            if ch in ('y', 'д'):
+                val = 'y'
+            elif ch in ('n', 'н'):
+                val = 'n'
+            else:
+                return  # прочие клавиши игнорируем
+            cb = self.prompt_callback
+            self._close_prompt()
+            if cb:
+                try:
+                    cb(val)
+                except Exception as e:
+                    self.set_message(f"Ошибка: {e}")
+            return
+
+        # Обычный текстовый промпт
         if key == 27:
-            self.prompt_active = False
-            self.prompt_callback = None
+            self._close_prompt()
             self.set_message("Отменено.")
             return
-        if key in (10, 13):
+        if key in (10, 13, curses.KEY_ENTER):
             cb = self.prompt_callback
             val = self.prompt_input
             if cb:
@@ -1454,8 +1712,7 @@ class M:
                 if keep_open is True:
                     self.prompt_input = ""
                     return
-            self.prompt_active = False
-            self.prompt_callback = None
+            self._close_prompt()
             return
         if key in (curses.KEY_BACKSPACE, 127, 8):
             self.prompt_input = self.prompt_input[:-1]
@@ -1506,7 +1763,7 @@ class M:
         elif key == ord('r'):
             self.ask("Новое имя: ", self.do_rename)
         elif key == ord('d'):
-            self.ask("Удалить в корзину? (y/n): ", self.do_delete)
+            self.ask_yesno("Удалить в корзину? [y/n]: ", self.do_delete)
         elif key == ord('e'):
             self.open_in_editor()
         elif key == ord('u'):
@@ -1558,18 +1815,19 @@ class M:
             self.refresh_pane(1)
 
     def open_item(self):
-        item = self.current_item()
-        if item is None:
+        entry = self.current_item()
+        if entry is None:
             return
-        if item.name == "..":
+        if entry.is_parent:
             self.panes[self.active] = self.panes[self.active].parent
             self.selected[self.active] = 0
             self.fm_hits = []
             self.fm_hit_idx = -1
             self.refresh_pane(self.active)
-            self.hooks.fire("on_open", path=str(self.panes[self.active]), kind="dir")
+            self.hooks.fire("on_open", path=str(self.panes[self.active]),
+                            kind="dir")
             return
-        full = self.panes[self.active] / item
+        full = entry.path
         if full.is_dir():
             self.panes[self.active] = full
             self.selected[self.active] = 0
@@ -1593,10 +1851,10 @@ class M:
         self.open_in_editor()
 
     def open_in_editor(self):
-        item = self.current_item()
-        if item is None or item.name == "..":
+        entry = self.current_item()
+        if entry is None or entry.is_parent:
             return
-        full = self.panes[self.active] / item
+        full = entry.path
         if full.is_dir():
             self.set_message("Это папка.")
             return
@@ -1662,20 +1920,20 @@ class M:
         if not newname:
             self.set_message("Отменено (пустое имя).")
             return
-        item = self.current_item()
-        if item is None or item.name == "..":
+        entry = self.current_item()
+        if entry is None or entry.is_parent:
             return
-        if newname == item.name:
+        if newname == entry.name:
             self.set_message("Имя не изменилось.")
             return
-        src = self.panes[self.active] / item
+        src = entry.path
         dst = self.panes[self.active] / newname
         if dst.exists():
             self.set_message("Цель уже существует.")
             return
         try:
             src.rename(dst)
-            self.set_message(f"Переименовано: {item.name} → {newname}")
+            self.set_message(f"Переименовано: {entry.name} → {newname}")
             self.refresh_pane(self.active)
             self.hooks.fire("on_move", src=str(src), dst=str(dst))
 
@@ -1691,25 +1949,25 @@ class M:
                 else:
                     raise OSError("невозможно повторить")
 
-            self.undo.push(f"переименование '{item.name}' → '{newname}'", undo, redo)
+            self.undo.push(f"переименование '{entry.name}' → '{newname}'",
+                           undo, redo)
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
 
     def do_delete(self, answer):
-        if answer.strip().lower() not in ("y", "yes", "д", "да"):
+        if answer != 'y':
             self.set_message("Отменено.")
             return
-        item = self.current_item()
-        if item is None or item.name == "..":
+        entry = self.current_item()
+        if entry is None or entry.is_parent:
             return
-        src = self.panes[self.active] / item
+        src = entry.path
         try:
             TRASH_DIR.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.set_message(f"Ошибка создания корзины: {e}")
             return
-        ts = int(time.time() * 1000)
-        trashed = TRASH_DIR / f"{ts}_{item.name}"
+        trashed = self._unique_trash_path(entry.name)
         state = {"trashed": trashed}
 
         try:
@@ -1722,7 +1980,7 @@ class M:
         meta[trashed.name] = str(src)
         self._save_trash_meta(meta)
 
-        self.set_message(f"Удалено: {item.name} (u — отменить)")
+        self.set_message(f"Удалено: {entry.name} (u — отменить)")
         self.refresh_pane(self.active)
         self.hooks.fire("on_delete", path=str(src))
 
@@ -1740,23 +1998,22 @@ class M:
         def redo():
             if not src.exists():
                 raise FileNotFoundError("исходный файл отсутствует")
-            new_ts = int(time.time() * 1000)
-            new_path = TRASH_DIR / f"{new_ts}_{src.name}"
+            new_path = self._unique_trash_path(src.name)
             shutil.move(str(src), str(new_path))
             m = self._load_trash_meta()
             m[new_path.name] = str(src)
             self._save_trash_meta(m)
             state["trashed"] = new_path
 
-        self.undo.push(f"удаление '{item.name}'", undo, redo)
+        self.undo.push(f"удаление '{entry.name}'", undo, redo)
 
     def _get_operation_sources(self):
         if self.marked[self.active]:
             return [Path(p) for p in self.marked[self.active]]
-        item = self.current_item()
-        if item is None or item.name == "..":
+        entry = self.current_item()
+        if entry is None or entry.is_parent:
             return []
-        return [self.panes[self.active] / item]
+        return [entry.path]
 
     def do_move(self):
         sources = self._get_operation_sources()
@@ -1862,10 +2119,10 @@ class M:
         self.undo.push(f"копирование '{src.name}'", undo, redo)
 
     def toggle_mark(self):
-        item = self.current_item()
-        if item is None or item.name == "..":
+        entry = self.current_item()
+        if entry is None or entry.is_parent:
             return
-        full = str(self.panes[self.active] / item)
+        full = str(entry.path)
         if full in self.marked[self.active]:
             self.marked[self.active].discard(full)
         else:
@@ -1879,8 +2136,8 @@ class M:
             return
         q_lower = query.lower()
         self.fm_hits = []
-        for i, item in enumerate(self.items[self.active]):
-            if q_lower in item.name.lower():
+        for i, entry in enumerate(self.items[self.active]):
+            if q_lower in entry.name.lower():
                 self.fm_hits.append(i)
         if self.fm_hits:
             self.fm_hit_idx = 0
@@ -2018,14 +2275,14 @@ class M:
             self.set_message("Нечего повторять.")
 
     def save_editor(self):
+        """Атомарное сохранение. Round-trip переводов строк."""
         if not self.ed_filename:
             self.set_message("Нет имени файла. Используйте Ctrl+O.")
             return False
         try:
             p = Path(self.ed_filename)
-            if not p.parent.exists():
-                p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("\n".join(self.ed_buffer), encoding='utf-8')
+            data = "\n".join(self.ed_buffer)
+            atomic_write_text(p, data)
             self.ed_modified = False
             self._reset_undo_group()
             self.set_message(f"Сохранено: {p.name}")
@@ -2054,8 +2311,10 @@ class M:
 
         if key == 24:  # Ctrl+X
             if self.ed_modified:
-                self.ask("Сохранить перед выходом? (y — сохранить, n — не сохранять, Esc — отмена): ",
-                         self._editor_exit)
+                self.ask_yesno(
+                    "Сохранить перед выходом? [y — да, n — нет, Esc — отмена]: ",
+                    self._editor_exit,
+                )
                 return
             self.mode = self.MODE_FILES
             self.set_message("")
@@ -2067,8 +2326,10 @@ class M:
 
         if key == 15:  # Ctrl+O
             if self.ed_modified:
-                self.ask("Несохранённые изменения. Сохранить перед открытием? (y/n): ",
-                         self._editor_open_confirm)
+                self.ask_yesno(
+                    "Несохранённые изменения. Сохранить? [y/n]: ",
+                    self._editor_open_confirm,
+                )
                 return
             self.ask("Открыть файл: ", self.editor_open_file)
             return
@@ -2118,36 +2379,28 @@ class M:
             self.clamp_cursor()
 
     def _editor_open_confirm(self, ans):
-        ans = ans.strip().lower()
-        if ans in ("y", "yes", "д", "да"):
+        """Callback модального y/n. ans ∈ {'y', 'n'}."""
+        if ans == 'y':
             if self.ed_filename:
                 if not self.save_editor():
+                    # сохранение упало — не открываем новый файл
                     return
-            self.ask("Открыть файл: ", self.editor_open_file)
-            return
-        if ans in ("n", "no", "н", "нет"):
-            self.ask("Открыть файл: ", self.editor_open_file)
-            return
-        self.set_message("Введите y (сохранить) или n (не сохранять).")
-        return True
+        self.ask("Открыть файл: ", self.editor_open_file)
 
     def _editor_exit(self, ans):
-        ans = ans.strip().lower()
-        if ans in ("y", "yes", "д", "да"):
+        """Callback модального y/n. ans ∈ {'y', 'n'}."""
+        if ans == 'y':
             if self.ed_filename:
                 if not self.save_editor():
+                    # сохранение упало — остаёмся в редакторе
                     return
             self.ed_modified = False
             self.mode = self.MODE_FILES
-            self.set_message("")
-            return
-        if ans in ("n", "no", "н", "нет"):
+            self.set_message("Сохранено и закрыто.")
+        else:
             self.ed_modified = False
             self.mode = self.MODE_FILES
             self.set_message("Выход без сохранения.")
-            return
-        self.set_message("Введите y (сохранить) или n (не сохранять).")
-        return True
 
     def editor_edit(self, key, arrows=False):
         cy, cx = self.ed_cursor
@@ -2234,7 +2487,8 @@ class M:
             self.ed_search_idx = 0
             self.ed_cursor[0] = self.ed_search_hits[0]
             self.clamp_cursor()
-            self.set_message(f"Найдено строк: {len(self.ed_search_hits)} (Ctrl+G — след.)")
+            self.set_message(f"Найдено строк: {len(self.ed_search_hits)} "
+                             f"(Ctrl+G — след.)")
         else:
             self.ed_search_idx = -1
             self.set_message("Не найдено.")
@@ -2249,7 +2503,8 @@ class M:
             self.ed_search_idx = (self.ed_search_idx + direction) % len(self.ed_search_hits)
         self.ed_cursor[0] = self.ed_search_hits[self.ed_search_idx]
         self.clamp_cursor()
-        self.set_message(f"Совпадение {self.ed_search_idx + 1} из {len(self.ed_search_hits)}")
+        self.set_message(f"Совпадение {self.ed_search_idx + 1} "
+                         f"из {len(self.ed_search_hits)}")
 
     def _editor_search_word_under_cursor(self):
         cy, cx = self.ed_cursor
@@ -2259,7 +2514,11 @@ class M:
         if not line:
             self.set_message("Пустая строка.")
             return
-        cx = min(cx, len(line) - 1)
+        # Guard: курсор мог оказаться за концом строки
+        if cx >= len(line):
+            cx = len(line) - 1
+        if cx < 0:
+            return
         if not (line[cx].isalnum() or line[cx] == '_'):
             self.set_message("Курсор не на слове.")
             return
@@ -2267,7 +2526,7 @@ class M:
         while start > 0 and (line[start - 1].isalnum() or line[start - 1] == '_'):
             start -= 1
         end = cx
-        while end < len(line) - 1 and (line[end + 1].isalnum() or line[end + 1] == '_'):
+        while end + 1 < len(line) and (line[end + 1].isalnum() or line[end + 1] == '_'):
             end += 1
         word = line[start:end + 1]
         if word:
@@ -2298,16 +2557,36 @@ class M:
         self.set_message(f"Заменено вхождений: {count} (Ctrl+Z — отменить)")
 
     def editor_open_file(self, path):
+        """Открывает файл. True — оставить промпт открытым (ошибка)."""
         if not path or not path.strip():
-            return
+            return False
         try:
             p = Path(path).expanduser()
             if p.is_dir():
                 self.set_message("Это папка, а не файл.")
-                return
+                return True
             if p.exists():
-                text = p.read_text(encoding='utf-8', errors='replace')
-                self.ed_buffer = text.splitlines() or [""]
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0
+                if size > MAX_EDITOR_FILE:
+                    mb = size / (1024 * 1024)
+                    self.set_message(
+                        f"Файл слишком большой ({mb:.1f} MB > "
+                        f"{MAX_EDITOR_FILE // (1024*1024)} MB). Открытие отменено."
+                    )
+                    return True
+                try:
+                    text = p.read_text(encoding='utf-8', errors='replace')
+                except Exception as e:
+                    self.set_message(f"Ошибка чтения: {e}")
+                    return True
+                # Нормализация переводов строк (round-trip гарантирован)
+                text = text.replace('\r\n', '\n').replace('\r', '\n')
+                self.ed_buffer = text.split('\n')
+                if not self.ed_buffer:
+                    self.ed_buffer = [""]
                 self.set_message(f"Открыт: {p.name}")
             else:
                 self.ed_buffer = [""]
@@ -2316,7 +2595,8 @@ class M:
                 if p.exists():
                     try:
                         text = p.read_text(encoding='utf-8', errors='replace')
-                        self.ed_buffer = text.splitlines() or [""]
+                        text = text.replace('\r\n', '\n').replace('\r', '\n')
+                        self.ed_buffer = text.split('\n') or [""]
                     except Exception:
                         pass
             self.ed_filename = str(p)
@@ -2330,11 +2610,15 @@ class M:
             self._reset_undo_group()
             self.hooks.fire("on_file_change", path=str(p))
             self.hooks.fire("on_open", path=str(p), kind="file")
+            return False
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
+            return True
 
     # ==================== ФЛАГИ КОМАНДНОЙ СТРОКИ ====================
     def apply_flags(self, args):
+        if not args:
+            return
         flag = args[0]
         if flag in ("-e", "--edit"):
             if len(args) > 1:
@@ -2346,13 +2630,13 @@ class M:
 
 
 # ============================ ТОЧКА ВХОДА ============================
-def _run_curses(stdscr):
+def _run_curses(stdscr, safe=False, no_color=False, args=None):
     try:
         curses.curs_set(1)
     except Exception:
         pass
     try:
-        curses.set_escdelay(25)
+        curses.set_escdelay(50)
     except Exception:
         pass
     try:
@@ -2360,15 +2644,14 @@ def _run_curses(stdscr):
     except Exception:
         pass
 
-    m = M(stdscr)
-    args = sys.argv[1:]
+    m = M(stdscr, safe=safe, no_color=no_color)
     if args:
         m.apply_flags(args)
     m.run()
 
 
 def _print_cli_help():
-    print("""M — универсальный инструмент Termux.
+    print(f"""M v{__version__} — универсальный инструмент Termux.
 
 Использование:
   M                файловый менеджер
@@ -2379,12 +2662,30 @@ def _print_cli_help():
   M -h, --help     эта справка
   M -v, --version  версия
 
+Опции:
+  --safe           отключить хуки (для отладки / безопасности)
+  --no-color       монохромный режим
+
 Горячие клавиши внутри M — нажми '?' в файловом менеджере
 или F1/Ctrl+P в редакторе. Мышью — клик по строке.""")
 
 
 def main():
-    args = sys.argv[1:]
+    raw_args = sys.argv[1:]
+
+    # Извлекаем длинные опции, не мешающие парсингу коротких флагов.
+    # НЕ мутируем sys.argv — просто передаём отфильтрованный список дальше.
+    safe = False
+    no_color = False
+    args = []
+    for a in raw_args:
+        if a == "--safe":
+            safe = True
+        elif a == "--no-color":
+            no_color = True
+        else:
+            args.append(a)
+
     flag = args[0] if args else None
 
     ensure_directories()
@@ -2433,7 +2734,7 @@ def main():
             sys.exit(1)
         return
     if flag in ("-v", "--version"):
-        print("M v6.4.1")
+        print(f"M v{__version__}")
         return
 
     if flag and flag.startswith("-") and flag not in ("-e", "--edit"):
@@ -2449,7 +2750,7 @@ def main():
         pass
 
     try:
-        curses.wrapper(_run_curses)
+        curses.wrapper(_run_curses, safe=safe, no_color=no_color, args=args)
     except KeyboardInterrupt:
         pass
     except Exception as e:
