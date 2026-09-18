@@ -2,33 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.6.0.
+Версия 6.6.1.
 
-Изменения относительно 6.5.9:
-  • КРИТИЧНО: undo/redo переименования корректно работают между
-    вкладками. Раньше замыкание обращалось к self.marked[panel]
-    динамически, а смена вкладки пересоздавала множества — метка
-    оставалась на несуществующем пути. Теперь:
-      – вкладки хранят marked по ссылке (не копией);
-      – do_rename захватывает set-объект в замыкание;
-      – do_move/do_copy мутируют set in-place (не пересоздают).
-  • do_delete.undo использует path_exists_lexists(t) вместо t.exists()
-    — undo битого симлинка больше не падает.
-  • _register_move_undo использует lexists — undo/redo перемещения
-    битого симлинка работает.
-  • _trash_delete_permanent / _trash_clear корректно удаляют
-    симлинки-на-каталоги (is_symlink перед is_dir).
-  • _trash_restore использует lexists для целевого пути —
-    битый симлинк на месте оригинала не перезатирается молча.
-  • Сообщения _editor_open_confirm/_editor_exit/save_editor
-    не вводят в заблуждение (совет не «Ctrl+S», а «ответьте n»).
-
-Базовые изменения 6.5.9 (сохранены):
-  • do_rename переносит отметку на новый путь (внутри панели).
-  • Битые симлинки не выпадают из _live_marks.
-  • Переключение вкладок сохраняет marked.
-  • -i / -c делают expanduser.
-  • open_in_editor на '..' сообщает, что редактировать нечего.
+Изменения относительно 6.5.10:
+  • do_rename: проверка целевого имени через path_exists_lexists.
+    Раньше битый симлинк на месте dst молча затирался src.rename.
+  • do_mkdir / do_newfile: та же защита — битый симлинк с таким
+    именем теперь блокирует создание.
+  • _unique_trash_path: path_exists_lexists — коллизия с битым
+    симлинком в корзине больше не приводит к его замене.
+  • _editor_exit / _editor_open_confirm: корректная обработка
+    случая «файл без имени + ответ y». Раньше ставилось сообщение
+    «Ответьте n», но промпт уже был закрыт — выйти было некуда.
+    Теперь _editor_exit в этом случае переспрашивает «выйти без
+    сохранения?»; _editor_open_confirm сообщает, что сохранять
+    нечего, и переходит к диалогу открытия.
+  • editor_open_file: явный отказ на битый симлинк (раньше считался
+    «новым файлом» и сохранение уничтожило бы симлинк).
+    Сообщение при пустом пути нейтральное — «Пустой путь — отменено».
+  • open_in_editor: явный отказ на битый симлинк.
+  • _get_operation_sources / _prompt_delete: убрана неявная мутация
+    marked — вынесена в _prune_dead_marks.
 """
 
 import curses
@@ -48,7 +42,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.6.0"
+__version__ = "6.6.1"
 
 
 HOME = Path.home()
@@ -140,11 +134,6 @@ def path_exists_lexists(p):
 
 
 def _remove_any(path):
-    """
-    Удаляет файл, каталог или симлинк безопасно:
-    rmtree по симлинку на каталог — ошибка, поэтому проверяем is_symlink
-    до is_dir.
-    """
     if path.is_symlink():
         path.unlink()
     elif path.is_dir():
@@ -324,9 +313,7 @@ class M:
         self.active = 0
         self.selected = [0, 0]
         self.items = [[], []]
-        # marked хранится по ссылке в tabs — это критично для замыканий
-        # undo/redo (см. do_rename). Никогда не пересоздаём set-объекты,
-        # только мутируем содержимое.
+
         init_marked = [set(), set()]
         self.marked = init_marked
         self.show_hidden = False
@@ -1408,7 +1395,7 @@ class M:
         base = f"{time.time_ns()}"
         candidate = TRASH_DIR / f"{base}_{name}"
         n = 1
-        while candidate.exists():
+        while path_exists_lexists(candidate):
             candidate = TRASH_DIR / f"{base}_{n}_{name}"
             n += 1
         return candidate
@@ -1444,7 +1431,6 @@ class M:
                 self.set_message("Некорректный путь в метаданных — отказ.")
                 return
             dst.parent.mkdir(parents=True, exist_ok=True)
-            # lexists, чтобы не перезатереть битый симлинк молча.
             if path_exists_lexists(dst):
                 base_dst = dst
                 counter = 1
@@ -1858,10 +1844,19 @@ class M:
         return [Path(p) for p in self.marked[self.active]
                 if path_exists_lexists(p)]
 
+    def _prune_dead_marks(self):
+        m = self.marked[self.active]
+        dead = [p for p in m if not path_exists_lexists(p)]
+        if not dead:
+            return False
+        for p in dead:
+            m.discard(p)
+        return True
+
     def _prompt_delete(self):
         live = self._live_marks()
         if not live and self.marked[self.active]:
-            self.marked[self.active].clear()
+            self._prune_dead_marks()
 
         if live:
             n = len(live)
@@ -1921,6 +1916,9 @@ class M:
             self.set_message("Нечего редактировать (курсор на '..').")
             return
         full = entry.path
+        if full.is_symlink() and not full.exists():
+            self.set_message("Битый симлинк — не редактируем.")
+            return
         if full.is_dir():
             self.set_message("Это папка.")
             return
@@ -1934,7 +1932,7 @@ class M:
             return
         try:
             p = self.panes[self.active] / name
-            if p.exists():
+            if path_exists_lexists(p):
                 self.set_message(f"'{name}' уже существует.")
                 return
             p.mkdir(parents=True)
@@ -1962,7 +1960,7 @@ class M:
             return
         try:
             p = self.panes[self.active] / name
-            if p.exists():
+            if path_exists_lexists(p):
                 self.set_message("Файл уже существует.")
                 return
             p.touch()
@@ -1996,13 +1994,10 @@ class M:
             return
         src = entry.path
         dst = self.panes[self.active] / newname
-        if dst.exists():
+        if path_exists_lexists(dst):
             self.set_message("Цель уже существует.")
             return
         try:
-            # Захватываем панель И set-объект: undo/redo могут быть вызваны
-            # после переключения панели/вкладки, когда self.marked уже
-            # указывает на другое множество.
             panel = self.active
             marked_set = self.marked[panel]
 
@@ -2087,8 +2082,6 @@ class M:
                 m = self._load_trash_meta()
                 try:
                     for s, t in pairs:
-                        # lexists: битый симлинк в корзине тоже должен
-                        # считаться «присутствующим».
                         if not path_exists_lexists(t):
                             raise FileNotFoundError(
                                 f"уже нет в корзине: {t.name}")
@@ -2141,8 +2134,7 @@ class M:
         live = self._live_marks()
         if live:
             return live
-        if self.marked[self.active]:
-            self.marked[self.active].clear()
+        self._prune_dead_marks()
         entry = self.current_item()
         if entry is None or entry.is_parent:
             return []
@@ -2176,8 +2168,6 @@ class M:
                 last_error = f"Ошибка: {e}"
                 failed.append(src)
 
-        # Мутируем set in-place — нельзя пересоздавать объект, иначе
-        # замыкания undo/redo переименования потеряют свою цель.
         m = self.marked[self.active]
         if failed:
             m.clear()
@@ -2310,14 +2300,11 @@ class M:
             self.set_message(f"Закладка: {current}")
         self.save_bookmarks()
 
-    # ==================== ВКЛАДКИ ====================
     def _save_tab_state(self):
         tab = self.tabs[self.active_tab]
         tab["panes"] = list(self.panes)
         tab["selected"] = list(self.selected)
         tab["active"] = self.active
-        # marked сохраняем ПО ССЫЛКЕ: любое замыкание undo/redo, держащее
-        # set-объект, должно видеть изменения после возврата во вкладку.
         tab["marked"] = self.marked
 
     def _take_tab_marked(self, tab):
@@ -2381,7 +2368,6 @@ class M:
         self.refresh_pane(1)
         self.set_message("Вкладка закрыта.")
 
-    # ==================== РЕДАКТОР ====================
     def _snapshot(self):
         return (list(self.ed_buffer), list(self.ed_cursor), self.ed_modified)
 
@@ -2433,10 +2419,7 @@ class M:
 
     def save_editor(self):
         if not self.ed_filename:
-            self.set_message(
-                "Файл без имени — сохранение недоступно. "
-                "Откройте через Ctrl+O."
-            )
+            self.set_message("Файл без имени — сохранить нельзя.")
             return False
         try:
             p = Path(self.ed_filename)
@@ -2536,22 +2519,24 @@ class M:
 
     def _editor_open_confirm(self, ans):
         if ans == 'y':
-            if not self.ed_filename:
+            if self.ed_filename:
+                if not self.save_editor():
+                    return
+            else:
+                # Нечего сохранять — файла нет.
                 self.set_message(
-                    "Файл без имени — сохранить нельзя. "
-                    "Ответьте 'n', чтобы открыть без сохранения."
+                    "Файл без имени — пропускаю сохранение."
                 )
-                return
-            if not self.save_editor():
-                return
         self.ask("Открыть файл: ", self.editor_open_file)
 
     def _editor_exit(self, ans):
         if ans == 'y':
             if not self.ed_filename:
-                self.set_message(
+                # Переспросим: пользователь хотел сохранить, но сохранять некуда.
+                self.ask_yesno(
                     "Файл без имени — сохранить нельзя. "
-                    "Ответьте 'n', чтобы выйти без сохранения."
+                    "Выйти без сохранения? [y/д, n/н]: ",
+                    self._editor_exit_nosave,
                 )
                 return
             if not self.save_editor():
@@ -2563,6 +2548,14 @@ class M:
             self.ed_modified = False
             self.mode = self.MODE_FILES
             self.set_message("Выход без сохранения.")
+
+    def _editor_exit_nosave(self, ans):
+        if ans == 'y':
+            self.ed_modified = False
+            self.mode = self.MODE_FILES
+            self.set_message("Выход без сохранения.")
+        else:
+            self.set_message("Отменено — остаёмся в редакторе.")
 
     def editor_edit(self, key, arrows=False):
         cy, cx = self.ed_cursor
@@ -2722,10 +2715,13 @@ class M:
             return True
         path = path.strip()
         if not path:
-            self.set_message("Пусто — Esc для отмены.")
+            self.set_message("Пустой путь — отменено.")
             return True
         try:
             p = Path(path).expanduser()
+            if p.is_symlink() and not p.exists():
+                self.set_message(f"Битый симлинк: {p.name}")
+                return True
             if p.is_dir():
                 self.set_message("Это папка, а не файл.")
                 return True
