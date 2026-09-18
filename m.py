@@ -2,28 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.4 — правки по итогам ревью 6.5.3.
+Версия 6.5.5 — фикс модальных экранов, new_tab, мелких недоработок.
 
-Изменения относительно 6.5.3:
-  • KEY_RESIZE обрабатывается в главном цикле до промпта — раньше при
-    активном Ctrl+O / поиске / y/n и повороте экрана лэйаут не
-    пересчитывался до следующей нажатой клавиши.
-  • do_copy и do_move теперь применяют батч-таймаут хуков
-    (HOOK_TIMEOUT_BATCH) при массовых операциях — как do_delete.
-    Устраняет фриз UI на N × HOOK_TIMEOUT при медленном хуке.
-  • _trash_restore при конфликте имён подбирает уникальный суффикс
-    _restored1..100, а не одну единственную форму — второй конфликт
-    больше не роняет восстановление.
-  • Шапка: дополнены комментарии по семантике хуков.
+Изменения относительно 6.5.4:
+  • Модальные экраны (справка, справка редактора, менеджер хуков,
+    дашборд) больше не вылетают при повороте экрана. KEY_RESIZE
+    в них теперь не завершает режим, а лишь перерисовывает его
+    в новом размере (через main loop).
+  • new_tab использует текущий каталог активной панели, а не
+    Path.cwd() процесса — новая вкладка открывается там, где
+    пользователь реально находится.
+  • _prompt_delete: явное сообщение, если удалять нечего
+    (курсор на '..', отметок нет).
+  • Убрана недостижимая ветка KEY_RESIZE в handle_editor_key
+    (main loop обрабатывает resize раньше диспетчеризации).
+  • Мелочи: шапка в порядке.
+
+Базовые изменения 6.5.4 (сохранены):
+  • KEY_RESIZE обрабатывается в главном цикле до промпта.
+  • do_copy/do_move применяют HOOK_TIMEOUT_BATCH при массовых
+    операциях (как do_delete).
+  • _trash_restore подбирает уникальный суффикс _restored1..100.
 
 Базовые изменения 6.5.3 (сохранены):
   • Enter в редакторе принимает curses.KEY_ENTER.
   • atomic_write_text сохраняет права существующего файла.
   • editor_open_file отвергает FIFO, /dev/*, сокеты.
   • do_mkdir: «уже существует» — отдельное сообщение.
-  • do_delete: on_delete в батче с укороченным таймаутом.
-  • _prompt_delete: согласованная формулировка для 1 и N файлов.
-  • _draw_prompt: убран лишний ведущий пробел у message.
   • HookManager.fire принимает timeout=.
 """
 
@@ -44,7 +49,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.4"
+__version__ = "6.5.5"
 
 
 # ============================ ПУТИ ============================
@@ -73,7 +78,7 @@ TABSTOP = 8
 
 MAX_EDITOR_FILE = 10 * 1024 * 1024  # 10 MB
 HOOK_TIMEOUT = 2.0          # секунд, для одиночных событий
-HOOK_TIMEOUT_BATCH = 0.3    # секунд на файл при батче (on_delete/on_create/on_move)
+HOOK_TIMEOUT_BATCH = 0.3    # секунд на файл при батче
 TRASH_SAVE_EVERY = 10
 
 # Единица списка панели
@@ -93,10 +98,7 @@ _DANGEROUS_RESTORE_PREFIXES = {
 def atomic_write_text(path, text, encoding="utf-8"):
     """
     Атомарная запись текста: tmp-файл рядом с целевым + os.replace.
-    Сохраняет права существующего целевого файла (mkstemp создаёт 0600,
-    а нам нужен прежний режим, если файл уже был).
-
-    Бросает исключение при ошибке — вызывающий решает, что делать.
+    Сохраняет права существующего целевого файла.
     """
     path = Path(path)
     if not path.parent.exists():
@@ -226,11 +228,8 @@ class HookManager:
     def fire(self, event, timeout=None, **kwargs):
         """
         Событие-действие. Для TIMEOUT_EVENTS — с таймаутом.
-        timeout= переопределяет HOOK_TIMEOUT на один вызов
-        (используется для батчей, см. do_delete/do_copy/do_move).
-
-        ВНИМАНИЕ: параметр `timeout` перехватывается и НЕ передаётся в хук.
-        Если вашему хуку нужен свой timeout — назовите параметр иначе.
+        timeout= переопределяет HOOK_TIMEOUT на один вызов.
+        Параметр `timeout` перехватывается и в хук не передаётся.
         """
         timed = event in self.TIMEOUT_EVENTS
         actual_timeout = HOOK_TIMEOUT if timeout is None else timeout
@@ -241,7 +240,6 @@ class HookManager:
                 self._call_sync(name, event, fn, kwargs)
 
     def fire_collect(self, event, **kwargs):
-        """Событие-рендер. Возвращает список не-None результатов. Без таймаута."""
         results = []
         for name, fn in self.hooks.get(event, []):
             r = self._call_sync(name, event, fn, kwargs)
@@ -647,7 +645,6 @@ class M:
 
     @staticmethod
     def _char_to_col_table(line, tabstop=TABSTOP):
-        """Таблица char→col, линейно по длине строки."""
         table = [0] * (len(line) + 1)
         col = 0
         for i, ch in enumerate(line):
@@ -762,12 +759,6 @@ class M:
 
     # ==================== ОТРИСОВКА ПРОМПТА ====================
     def _draw_prompt(self, h, w):
-        """
-        Промпт рисуется в нижних строках окна:
-          • если есть self.message — промпт h-2, сообщение h-1;
-          • иначе — только промпт h-1.
-        Статусбар при активном промпте не рисуется (см. вызывающий код).
-        """
         if self.prompt_yesno:
             prompt_line = f" {self.prompt_text}"
             self._set_cursor_visible(False)
@@ -1017,7 +1008,6 @@ class M:
             except Exception:
                 pass
 
-        # Внешний спан побеждает вложенный.
         spans = sorted(normal_spans, key=lambda s: (s[0], -s[1]))
         cleaned = []
         last_end = 0
@@ -1106,9 +1096,12 @@ class M:
         self._set_cursor_visible(False)
         self.stdscr.refresh()
         try:
-            self._get_key()
+            k = self._get_key()
         except Exception:
-            pass
+            k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return  # режим не меняем, main loop перерисует
         self.mode = self.return_mode
 
     def draw_help_editor(self):
@@ -1148,9 +1141,12 @@ class M:
         self._set_cursor_visible(False)
         self.stdscr.refresh()
         try:
-            self._get_key()
+            k = self._get_key()
         except Exception:
-            pass
+            k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         self.mode = self.MODE_EDITOR
 
     # ==================== ХУКИ ====================
@@ -1192,6 +1188,9 @@ class M:
             k = self._get_key()
         except Exception:
             k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         if k in (ord('r'), ord('R')):
             self.hooks.reload()
             self.set_message("Хуки перезагружены.")
@@ -1274,9 +1273,12 @@ class M:
         self._set_cursor_visible(False)
         self.stdscr.refresh()
         try:
-            self._get_key()
+            k = self._get_key()
         except Exception:
-            pass
+            k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         self.mode = self.MODE_FILES
 
     # ==================== ЗАКЛАДКИ ====================
@@ -1308,6 +1310,9 @@ class M:
             k = self._get_key()
         except Exception:
             k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         if k == 27:
             self.mode = self.MODE_FILES
         elif k == curses.KEY_DOWN and self.bookmarks:
@@ -1361,6 +1366,9 @@ class M:
             k = self._get_key()
         except Exception:
             k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         if k == 27:
             self.mode = self.MODE_FILES
         elif k == curses.KEY_DOWN and items:
@@ -1421,11 +1429,6 @@ class M:
 
     @staticmethod
     def _is_safe_restore_path(p):
-        """
-        Защита от подмены meta.json: только абсолютные пути, не короче
-        3 компонент, и не в системных каталогах. '/data' разрешён —
-        там Termux home.
-        """
         try:
             if not p.is_absolute():
                 return False
@@ -1455,9 +1458,6 @@ class M:
                 self.set_message("Некорректный путь в метаданных — отказ.")
                 return
             dst.parent.mkdir(parents=True, exist_ok=True)
-            # Если целевое имя занято, подбираем уникальный суффикс.
-            # Раньше была единственная форма "_restored" — при повторе
-            # конфликта shutil.move падал и файл оставался в корзине.
             if dst.exists():
                 base_dst = dst
                 counter = 1
@@ -1534,6 +1534,9 @@ class M:
             k = self._get_key()
         except Exception:
             k = -1
+        if k == curses.KEY_RESIZE:
+            self._init_mouse()
+            return
         if k == 27:
             self.mode = self.MODE_FILES
         elif k == curses.KEY_DOWN and self.archive_items:
@@ -1683,9 +1686,6 @@ class M:
                 self._handle_mouse()
                 continue
 
-            # KEY_RESIZE обрабатываем до промпта — иначе при активном
-            # вводе (y/n, Ctrl+O, поиск) поворот экрана не пересчитывал
-            # лэйаут до следующей клавиши.
             if key == curses.KEY_RESIZE:
                 self._init_mouse()
                 if self.mode == self.MODE_FILES:
@@ -1732,7 +1732,6 @@ class M:
         self.message = ""
 
     def handle_prompt_key(self, key):
-        # Модальный y/n
         if self.prompt_yesno:
             if key == 27:
                 self._close_prompt()
@@ -1761,7 +1760,6 @@ class M:
                     self.set_message(f"Ошибка: {e}")
             return
 
-        # Обычный текстовый промпт
         if key == 27:
             self._close_prompt()
             self.set_message("Отменено.")
@@ -1886,6 +1884,7 @@ class M:
         else:
             entry = self.current_item()
             if entry is None or entry.is_parent:
+                self.set_message("Нечего удалять (курсор на '..').")
                 return
             text = f"Удалить '{entry.name}' в корзину? [y/д, n/н]: "
         self.ask_yesno(text, self.do_delete)
@@ -2035,14 +2034,9 @@ class M:
 
     def do_delete(self, answer):
         """
-        Массовое удаление с учётом отметок, как в do_copy/do_move.
-
-        Устойчивость к крашу: meta сохраняется каждые TRASH_SAVE_EVERY
-        успешных перемещений. Undo/redo сохраняют meta в finally.
-
-        Хуки: on_delete вызывается на каждый файл, но в батче (sources > 1)
-        с укороченным таймаутом HOOK_TIMEOUT_BATCH — иначе N × HOOK_TIMEOUT
-        фризило бы UI при медленном хуке.
+        Массовое удаление с учётом отметок.
+        Meta сохраняется каждые TRASH_SAVE_EVERY; undo/redo — в finally.
+        Хуки: on_delete вызывается на каждый файл, в батче с коротким таймаутом.
         """
         if answer != 'y':
             self.set_message("Отменено.")
@@ -2058,7 +2052,7 @@ class M:
             return
 
         meta = self._load_trash_meta()
-        pairs = []  # (src, trashed)
+        pairs = []
         failed = 0
         last_error = ""
         moved_since_save = 0
@@ -2156,7 +2150,6 @@ class M:
         success = 0
         last_error = ""
 
-        # Батч-таймаут хука при массовой операции — как в do_delete.
         hook_timeout = HOOK_TIMEOUT if len(sources) == 1 else HOOK_TIMEOUT_BATCH
 
         for src in sources:
@@ -2209,7 +2202,6 @@ class M:
         success = 0
         last_error = ""
 
-        # Батч-таймаут хука при массовой операции — как в do_delete.
         hook_timeout = HOOK_TIMEOUT if len(sources) == 1 else HOOK_TIMEOUT_BATCH
 
         for src in sources:
@@ -2332,7 +2324,9 @@ class M:
 
     def new_tab(self):
         self._save_tab_state()
-        cwd = Path.cwd()
+        # Новая вкладка открывается в текущем каталоге активной панели,
+        # а не в Path.cwd() процесса (который за время работы не менялся).
+        cwd = self.panes[self.active]
         self.tabs.append({
             "panes": [cwd, cwd],
             "selected": [0, 0],
@@ -2447,9 +2441,6 @@ class M:
         if key == curses.KEY_F1 or key == 16:
             self.mode = self.MODE_HELP_EDITOR
             return
-        if key == curses.KEY_RESIZE:
-            self._init_mouse()
-            return
 
         if key == 24:  # Ctrl+X
             if self.ed_modified:
@@ -2521,7 +2512,6 @@ class M:
             self.clamp_cursor()
 
     def _editor_open_confirm(self, ans):
-        """Callback модального y/n. ans ∈ {'y', 'n'}."""
         if ans == 'y':
             if self.ed_filename:
                 if not self.save_editor():
@@ -2529,7 +2519,6 @@ class M:
         self.ask("Открыть файл: ", self.editor_open_file)
 
     def _editor_exit(self, ans):
-        """Callback модального y/n. ans ∈ {'y', 'n'}."""
         if ans == 'y':
             if self.ed_filename:
                 if not self.save_editor():
@@ -2570,7 +2559,6 @@ class M:
                 self.ed_cursor[1] = len(self.ed_buffer[cy])
                 return
 
-        # Enter — включая KEY_ENTER на терминалах, которые его шлют
         if key in (10, 13, curses.KEY_ENTER):
             line = self.ed_buffer[cy]
             self.ed_buffer[cy] = line[:cx]
@@ -2709,8 +2697,6 @@ class M:
                 self.set_message("Это папка, а не файл.")
                 return True
             if p.exists():
-                # Отсекаем FIFO, /dev/*, сокеты и т. п. — read_text
-                # на них может повесить процесс.
                 try:
                     if not p.is_file():
                         self.set_message("Не обычный файл.")
