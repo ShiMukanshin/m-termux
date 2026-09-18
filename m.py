@@ -2,27 +2,39 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.6.1.
+Версия 6.7.0.
 
-Изменения относительно 6.5.10:
-  • do_rename: проверка целевого имени через path_exists_lexists.
-    Раньше битый симлинк на месте dst молча затирался src.rename.
-  • do_mkdir / do_newfile: та же защита — битый симлинк с таким
-    именем теперь блокирует создание.
-  • _unique_trash_path: path_exists_lexists — коллизия с битым
-    симлинком в корзине больше не приводит к его замене.
-  • _editor_exit / _editor_open_confirm: корректная обработка
-    случая «файл без имени + ответ y». Раньше ставилось сообщение
-    «Ответьте n», но промпт уже был закрыт — выйти было некуда.
-    Теперь _editor_exit в этом случае переспрашивает «выйти без
-    сохранения?»; _editor_open_confirm сообщает, что сохранять
-    нечего, и переходит к диалогу открытия.
-  • editor_open_file: явный отказ на битый симлинк (раньше считался
-    «новым файлом» и сохранение уничтожило бы симлинк).
-    Сообщение при пустом пути нейтральное — «Пустой путь — отменено».
-  • open_in_editor: явный отказ на битый симлинк.
-  • _get_operation_sources / _prompt_delete: убрана неявная мутация
-    marked — вынесена в _prune_dead_marks.
+Изменения относительно 6.6.1:
+  • atomic_write_text: сохраняет симлинки (пишет в цель, не разрушает
+    ссылку), новым файлам выдаёт права с учётом umask (0644 по умолчанию),
+    корректно обрабатывает битые симлинки (отказ).
+  • addstr: фильтрация управляющих символов (кроме \\t) для защиты от
+    терминальных инъекций через имена файлов, содержимое файлов и т.п.;
+    табы разворачиваются в пробелы (не зависят от настроек терминала).
+  • do_mkdir / do_newfile / do_rename: строгая валидация имени —
+    запрещены «/», «\\0», «.», «..», абсолютные пути.
+  • do_copy: copytree(symlinks=True) — не разыменовывает симлинки,
+    защита от циклов и переполнения диска.
+  • _trash_clear: подтверждение (двойное нажатие C).
+  • _trash_delete_permanent: подтверждение.
+  • _extract_archive: пропускает существующие файлы (не перезаписывает),
+    отчёт по пропущенным; отдельная ветка для zip и tar.
+  • _unique_trash_path: обрезка слишком длинных имён (ENAMETOOLONG).
+  • open_bookmark: проверяет, что цель — директория.
+  • _mouse_scroll в редакторе: независимая прокрутка представления,
+    не двигает курсор и не сбрасывает группу undo.
+  • clamp_cursor: автоматически удерживает курсор в видимой области
+    (без вызова из draw_editor — там только ограничение скролла).
+  • CLI -i / -c: отказ при попытке перезаписать существующий файл;
+    -m: отказ, если имя уже существует; у -i / -c / -m проверка
+    существования источника.
+  • do_move / do_copy: явное сообщение при пустом наборе источников.
+  • refresh_pane: сообщение пользователю при ошибке доступа.
+  • Меньше «except Exception: pass» — сообщения пользователю сохранены.
+  • Ctrl+R (замена): сначала показывает количество совпадений (отмена —
+    пустая строка), затем выполняет замену.
+  • Экранирование \\r, \\n, \\x1b и др. в статусной строке и подсказках.
+  • Порядок раскладки клавиш в статусной строке расширен.
 """
 
 import curses
@@ -42,7 +54,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.6.1"
+__version__ = "6.7.0"
 
 
 HOME = Path.home()
@@ -69,6 +81,7 @@ MAX_EDITOR_FILE = 10 * 1024 * 1024
 HOOK_TIMEOUT = 2.0
 HOOK_TIMEOUT_BATCH = 0.3
 TRASH_SAVE_EVERY = 10
+TRASH_NAME_LIMIT = 200
 
 _Entry = namedtuple("_Entry", ["path", "name", "is_dir", "is_parent"])
 
@@ -80,8 +93,49 @@ _DANGEROUS_RESTORE_PREFIXES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_display(s):
+    """Заменяет управляющие символы (кроме \\t) на безопасные отображения.
+
+    Сохраняет ширину 1 колонка на символ, чтобы вычисления позиций
+    курсора в редакторе оставались верными.
+    """
+    if not s:
+        return s
+    need = False
+    for c in s:
+        cp = ord(c)
+        if c != '\t' and (cp < 0x20 or cp == 0x7f):
+            need = True
+            break
+    if not need:
+        return s
+    out = []
+    for c in s:
+        cp = ord(c)
+        if c == '\t':
+            out.append(c)
+        elif cp < 0x20 or cp == 0x7f:
+            out.append('\u00b7')  # middle dot: ширина 1
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
 def atomic_write_text(path, text, encoding="utf-8"):
     path = Path(path)
+
+    # Если path — симлинк, пишем в цель, не разрушая ссылку.
+    if path.is_symlink():
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as e:
+            raise OSError(f"Не удалось разрешить симлинк {path}: {e}")
+        path = resolved
+
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -101,10 +155,15 @@ def atomic_write_text(path, text, encoding="utf-8"):
         with os.fdopen(fd, "w", encoding=encoding) as fh:
             fh.write(text)
         if old_mode is not None:
-            try:
-                os.chmod(tmp_name, old_mode)
-            except OSError:
-                pass
+            new_mode = old_mode
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            new_mode = 0o666 & ~umask
+        try:
+            os.chmod(tmp_name, new_mode)
+        except OSError:
+            pass
         os.replace(tmp_name, str(path))
     except Exception:
         try:
@@ -141,6 +200,18 @@ def _remove_any(path):
     else:
         path.unlink()
 
+
+def _is_valid_basename(name):
+    if not name or name in ('.', '..'):
+        return False
+    if '/' in name or '\0' in name:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Hook manager
+# ---------------------------------------------------------------------------
 
 class HookManager:
     TIMEOUT_EVENTS = {
@@ -181,6 +252,12 @@ class HookManager:
         try:
             ensure_directories()
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            # Простая защита от неограниченного роста лога.
+            try:
+                if HOOKS_LOG.exists() and HOOKS_LOG.stat().st_size > 1_000_000:
+                    HOOKS_LOG.replace(HOOKS_LOG.with_suffix(".log.old"))
+            except OSError:
+                pass
             with open(HOOKS_LOG, "a", encoding="utf-8") as fh:
                 fh.write(f"[{ts}] {msg}\n")
         except Exception:
@@ -252,6 +329,10 @@ class NullHookManager:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Undo manager
+# ---------------------------------------------------------------------------
+
 class UndoManager:
     def __init__(self, max_size=100):
         self.undo_stack = deque(maxlen=max_size)
@@ -283,6 +364,10 @@ class UndoManager:
         except Exception as e:
             return f"Ошибка повтора: {e}"
 
+
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 
 class M:
     MODE_FILES = "files"
@@ -356,6 +441,9 @@ class M:
         self.archive_items = []
         self.archive_kind = None
 
+        self._trash_clear_pending = 0.0
+        self._trash_del_pending = 0.0
+
         self.load_config()
         self.load_bookmarks()
         self.init_colors()
@@ -363,13 +451,15 @@ class M:
         self.refresh_pane(0)
         self.refresh_pane(1)
 
+    # ---------------- config / bookmarks ----------------
+
     def load_config(self):
         try:
             if CONFIG_FILE.exists():
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 self.show_hidden = bool(data.get("show_hidden", False))
-        except Exception:
-            pass
+        except Exception as e:
+            self.set_message(f"Ошибка чтения конфига: {e}")
 
     def save_config(self):
         try:
@@ -378,8 +468,8 @@ class M:
                 CONFIG_FILE,
                 json.dumps({"show_hidden": self.show_hidden}, indent=2),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.set_message(f"Ошибка сохранения конфига: {e}")
 
     def load_bookmarks(self):
         try:
@@ -387,7 +477,8 @@ class M:
                 data = json.loads(BOOKMARKS_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, list):
                     self.bookmarks = [str(b) for b in data if isinstance(b, str)]
-        except Exception:
+        except Exception as e:
+            self.set_message(f"Ошибка чтения закладок: {e}")
             self.bookmarks = []
 
     def save_bookmarks(self):
@@ -397,8 +488,10 @@ class M:
                 BOOKMARKS_FILE,
                 json.dumps(self.bookmarks, indent=2),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.set_message(f"Ошибка сохранения закладок: {e}")
+
+    # ---------------- colors / mouse ----------------
 
     def init_colors(self):
         if self.no_color:
@@ -481,11 +574,11 @@ class M:
 
     def _mouse_scroll(self, delta):
         if self.mode == self.MODE_EDITOR:
-            key = curses.KEY_UP if delta < 0 else curses.KEY_DOWN
-            for _ in range(abs(delta)):
-                self.editor_edit(key, arrows=True)
-            self.clamp_cursor()
-            self._reset_undo_group()
+            h, w = self.stdscr.getmaxyx()
+            visible_h = max(1, h - 3)
+            max_scroll = max(0, len(self.ed_buffer) - visible_h)
+            new_scroll = self.ed_scroll + delta
+            self.ed_scroll = max(0, min(new_scroll, max_scroll))
         elif self.mode == self.MODE_FILES:
             idx = self.active
             step = -abs(delta) if delta < 0 else abs(delta)
@@ -551,10 +644,10 @@ class M:
         cx = self._col_to_char(line, mx)
         self.ed_cursor = [line_idx, cx]
         self.clamp_cursor()
-        self._reset_undo_group()
+
+    # ---------------- key input ----------------
 
     def _get_key(self):
-        ch = None
         try:
             ch = self.stdscr.get_wch()
         except AttributeError:
@@ -582,6 +675,8 @@ class M:
             curses.curs_set(1 if visible else 0)
         except Exception:
             pass
+
+    # ---------------- width helpers ----------------
 
     @staticmethod
     def _char_width(ch):
@@ -638,6 +733,8 @@ class M:
         table[len(line)] = col
         return table
 
+    # ---------------- pane refresh ----------------
+
     def refresh_pane(self, idx):
         base = self.panes[idx]
         entries = [_Entry(base.parent, "..", True, True)]
@@ -657,10 +754,12 @@ class M:
                 entries.append(_Entry(p, p.name, is_dir, False))
         except FileNotFoundError:
             self.set_message(f"Каталог не найден: {base}")
+        except NotADirectoryError:
+            self.set_message(f"Не каталог: {base}")
         except PermissionError:
             self.set_message(f"Нет доступа: {base}")
-        except Exception:
-            pass
+        except OSError as e:
+            self.set_message(f"Ошибка чтения {base}: {e}")
         self.items[idx] = entries
 
         if self.selected[idx] >= len(self.items[idx]):
@@ -674,14 +773,20 @@ class M:
             return self.items[idx][self.selected[idx]]
         return None
 
+    # ---------------- low-level output ----------------
+
     def addstr(self, y, x, text, attr=0):
         try:
             h, w = self.stdscr.getmaxyx()
             if y < 0 or y >= h or x < 0 or x >= w:
                 return
             s = str(text)
+            if not s:
+                return
+            s = _sanitize_display(s)
+
             avail = w - x - 1
-            if avail <= 0 or not s:
+            if avail <= 0:
                 return
 
             if s.isascii() and '\t' not in s:
@@ -697,12 +802,17 @@ class M:
             for ch in s:
                 if ch == '\t':
                     nxt = ((col // TABSTOP) + 1) * TABSTOP
+                    if nxt > max_col:
+                        break
+                    out.append(' ' * (nxt - col))
+                    col = nxt
                 else:
-                    nxt = col + M._char_width(ch)
-                if nxt > max_col:
-                    break
-                out.append(ch)
-                col = nxt
+                    cw = M._char_width(ch)
+                    nxt = col + cw
+                    if nxt > max_col:
+                        break
+                    out.append(ch)
+                    col = nxt
             if out:
                 self.stdscr.addstr(y, x, ''.join(out), attr)
         except Exception:
@@ -717,7 +827,9 @@ class M:
             pass
 
     def set_message(self, msg):
-        self.message = msg
+        self.message = _sanitize_display(str(msg)) if msg else ""
+
+    # ---------------- file attributes / drawing ----------------
 
     def _is_archive_name(self, name):
         n = name.lower()
@@ -746,6 +858,8 @@ class M:
             prompt_line = f" {self.prompt_text}{self.prompt_input}"
             self._set_cursor_visible(True)
 
+        prompt_line = _sanitize_display(prompt_line)
+
         if self.message:
             self.addstr(h - 2, 0, prompt_line, self.cp(3, curses.A_BOLD))
             self.addstr(h - 1, 0, self.message, self.cp(4, curses.A_BOLD))
@@ -757,6 +871,8 @@ class M:
             if not self.prompt_yesno:
                 vcol = self._visual_col(prompt_line, len(prompt_line))
                 self.move_cursor(h - 1, min(vcol, w - 2))
+
+    # ---------------- draw: files ----------------
 
     def draw_files(self):
         self.stdscr.erase()
@@ -783,7 +899,8 @@ class M:
                         pass
             self._draw_pane(i, x0, width, h)
 
-        status = " Enter:откр m:папка n:next/новый i:пер c:коп d:удал e:ред ?:спр "
+        status = (" Enter:откр m:папка n:новый i:перенос c:коп "
+                  "d:удал r:пер e:ред ?:спр q:выход ")
 
         if self.prompt_active:
             self._draw_prompt(h, w)
@@ -827,6 +944,8 @@ class M:
             prefix = ">" if j == sel else " "
             self.addstr(2 + row, x0, f"{prefix}{mark} {name}", attr)
 
+    # ---------------- draw: editor ----------------
+
     def draw_editor(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
@@ -838,17 +957,14 @@ class M:
 
         visible_h = max(1, h - 3)
 
+        if not self.ed_buffer:
+            self.ed_buffer = [""]
         if self.ed_cursor[0] < 0:
             self.ed_cursor[0] = 0
         if self.ed_cursor[0] >= len(self.ed_buffer):
             self.ed_cursor[0] = max(0, len(self.ed_buffer) - 1)
 
-        cur = self.ed_cursor[0]
-        if cur < self.ed_scroll:
-            self.ed_scroll = cur
-        elif cur >= self.ed_scroll + visible_h:
-            self.ed_scroll = cur - visible_h + 1
-
+        # Только ограничиваем скролл; позиционирование — в clamp_cursor.
         max_scroll = max(0, len(self.ed_buffer) - visible_h)
         if self.ed_scroll > max_scroll:
             self.ed_scroll = max_scroll
@@ -900,11 +1016,17 @@ class M:
                     self.move_cursor(screen_y, min(base_vcol, w - 2))
                 else:
                     vcol = self._visual_col(line, cx)
-                    ch_w = max(1, self._char_width(ch))
-                    display_ch = " " if ch == "\t" else ch
-                    if vcol + ch_w <= w - 1:
+                    if ch == '\t':
+                        next_stop = ((vcol // TABSTOP) + 1) * TABSTOP
+                        ch_w = max(1, next_stop - vcol)
+                        display_ch = " " * ch_w
+                    else:
+                        ch_w = max(1, self._char_width(ch))
+                        display_ch = ch
+                    if vcol + 1 <= w - 1:
                         try:
-                            self.stdscr.addstr(screen_y, vcol, display_ch,
+                            self.stdscr.addstr(screen_y, vcol,
+                                               display_ch[:max(1, w - 2 - vcol)],
                                                curses.A_REVERSE | curses.A_BOLD)
                         except Exception:
                             pass
@@ -982,7 +1104,7 @@ class M:
             pad = ' ' * max(0, total - c)
             text = ''.join(vis) + pad
             try:
-                self.stdscr.addstr(y, 0, text, attr)
+                self.stdscr.addstr(y, 0, _sanitize_display(text), attr)
             except Exception:
                 pass
 
@@ -1015,6 +1137,8 @@ class M:
             pos = e
         if pos < len(line) and pad_cp is None:
             self.addstr(y, col(pos), line[pos:], curses.A_NORMAL)
+
+    # ---------------- draw: help (files) ----------------
 
     def draw_help(self):
         self.stdscr.erase()
@@ -1052,7 +1176,7 @@ class M:
             "  МЫШЬ:",
             "    клик         выбрать файл / панель",
             "    двойной клик открыть",
-            "    колесо       скролл (1 строка за тик)",
+            "    колесо       скролл",
             "",
             "  РЕДАКТОР: F1 или Ctrl+P внутри редактора",
             "",
@@ -1105,7 +1229,7 @@ class M:
             "",
             "  МЫШЬ:",
             "    клик         перенести курсор в точку клика",
-            "    колесо       скролл текста (1 строка за тик)",
+            "    колесо       прокрутка текста",
             "",
             "  Нажми любую клавишу…",
         ]
@@ -1125,6 +1249,8 @@ class M:
             self._init_mouse()
             return
         self.mode = self.MODE_EDITOR
+
+    # ---------------- draw: hooks ----------------
 
     def draw_hooks(self):
         self.stdscr.erase()
@@ -1155,7 +1281,7 @@ class M:
             for err in self.hooks.errors[:8]:
                 if y >= h - 3:
                     break
-                self.addstr(y, 0, f"   ! {err[:w-6]}", self.cp(4))
+                self.addstr(y, 0, f"   ! {err[:max(1, w-6)]}", self.cp(4))
                 y += 1
         self.addstr(h - 2, 0, " R:перезагрузить  любая:назад ", self.cp(3))
         self._set_cursor_visible(False)
@@ -1171,6 +1297,8 @@ class M:
             self.hooks.reload()
             self.set_message("Хуки перезагружены.")
         self.mode = self.MODE_FILES
+
+    # ---------------- draw: dashboard ----------------
 
     def draw_dashboard(self):
         self.stdscr.erase()
@@ -1210,6 +1338,7 @@ class M:
         except Exception:
             pass
         try:
+            count = 0
             for p in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
                 tfile = p / "temp"
                 if tfile.exists():
@@ -1217,9 +1346,10 @@ class M:
                         t = int(tfile.read_text().strip()) / 1000.0
                         if 0 < t < 200:
                             lines.append(f"  {p.name}: {t:.1f}°C")
+                            count += 1
                     except Exception:
                         pass
-                if len(lines) > 15:
+                if count > 15:
                     break
         except Exception:
             pass
@@ -1255,6 +1385,8 @@ class M:
             self._init_mouse()
             return
         self.mode = self.MODE_FILES
+
+    # ---------------- draw: bookmarks ----------------
 
     def draw_bookmarks(self):
         self.stdscr.erase()
@@ -1295,19 +1427,24 @@ class M:
             self.bm_idx = max(0, self.bm_idx - 1)
         elif k in (10, 13, curses.KEY_ENTER) and self.bookmarks:
             target = Path(self.bookmarks[self.bm_idx])
-            if target.exists():
+            if target.is_dir():
                 self.panes[self.active] = target
                 self.selected[self.active] = 0
                 self.refresh_pane(self.active)
                 self.set_message(f"Переход: {target}")
+                self.mode = self.MODE_FILES
+            elif target.exists():
+                self.set_message("Это файл, а не папка.")
             else:
                 self.set_message("Путь больше не существует.")
-            self.mode = self.MODE_FILES
         elif k == ord('d') and self.bookmarks:
             self.bookmarks.pop(self.bm_idx)
             self.save_bookmarks()
             if self.bm_idx >= len(self.bookmarks):
                 self.bm_idx = max(0, len(self.bookmarks) - 1)
+            self.set_message("Закладка удалена.")
+
+    # ---------------- draw: trash ----------------
 
     def draw_trash(self):
         self.stdscr.erase()
@@ -1332,6 +1469,10 @@ class M:
         self.addstr(h - 2, 0,
                     " ↑/↓:выбор  r:восст.  d:удалить  C:очистить  Esc:назад ",
                     self.cp(3))
+
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
+
         self._set_cursor_visible(False)
         self.stdscr.refresh()
 
@@ -1344,16 +1485,32 @@ class M:
             return
         if k == 27:
             self.mode = self.MODE_FILES
+            self._trash_clear_pending = 0.0
+            self._trash_del_pending = 0.0
         elif k == curses.KEY_DOWN and items:
             self.bm_idx = min(len(items) - 1, self.bm_idx + 1)
+            self._trash_del_pending = 0.0
         elif k == curses.KEY_UP:
             self.bm_idx = max(0, self.bm_idx - 1)
+            self._trash_del_pending = 0.0
         elif k == ord('r') and items and 0 <= self.bm_idx < len(items):
             self._trash_restore(items[self.bm_idx])
         elif k == ord('d') and items and 0 <= self.bm_idx < len(items):
-            self._trash_delete_permanent(items[self.bm_idx])
+            now = time.monotonic()
+            if now - self._trash_del_pending < 3.0:
+                self._trash_del_pending = 0.0
+                self._trash_delete_permanent(items[self.bm_idx])
+            else:
+                self._trash_del_pending = now
+                self.set_message("Нажмите 'd' ещё раз для удаления навсегда.")
         elif k == ord('C'):
-            self._trash_clear()
+            now = time.monotonic()
+            if now - self._trash_clear_pending < 3.0:
+                self._trash_clear_pending = 0.0
+                self._trash_clear_confirmed()
+            else:
+                self._trash_clear_pending = now
+                self.set_message("Нажмите 'C' ещё раз для очистки корзины.")
 
     def _list_trash(self):
         try:
@@ -1365,7 +1522,8 @@ class M:
                     continue
                 items.append((p.name, p))
             return items
-        except Exception:
+        except Exception as e:
+            self.set_message(f"Ошибка чтения корзины: {e}")
             return []
 
     def _load_trash_meta(self):
@@ -1388,16 +1546,21 @@ class M:
                 TRASH_META,
                 json.dumps(data, indent=2, ensure_ascii=False),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.set_message(f"Ошибка сохранения метаданных: {e}")
 
     def _unique_trash_path(self, name):
         base = f"{time.time_ns()}"
+        if len(name) > TRASH_NAME_LIMIT:
+            suffix = str(abs(hash(name)) % (10 ** 8))
+            name = name[:TRASH_NAME_LIMIT - len(suffix) - 1] + "_" + suffix
         candidate = TRASH_DIR / f"{base}_{name}"
         n = 1
         while path_exists_lexists(candidate):
             candidate = TRASH_DIR / f"{base}_{n}_{name}"
             n += 1
+            if n > 1000:
+                raise OSError("Не удалось подобрать уникальное имя в корзине")
         return candidate
 
     @staticmethod
@@ -1462,7 +1625,7 @@ class M:
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
 
-    def _trash_clear(self):
+    def _trash_clear_confirmed(self):
         try:
             if TRASH_DIR.exists():
                 for p in list(TRASH_DIR.iterdir()):
@@ -1474,6 +1637,8 @@ class M:
                 self.bm_idx = 0
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
+
+    # ---------------- draw: archive ----------------
 
     def draw_archive(self):
         self.stdscr.erase()
@@ -1490,9 +1655,11 @@ class M:
             if 2 + i >= h - 2:
                 break
             attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
-            self.addstr(2 + i, 0, f"  {name[:w-6]}", attr)
+            self.addstr(2 + i, 0, f"  {name[:max(1, w-6)]}", attr)
         self.addstr(h - 2, 0, " ↑/↓:нав.  x:распаковать всё сюда  Esc:назад ",
                     self.cp(3))
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
 
@@ -1559,6 +1726,7 @@ class M:
         base = Path(target).resolve()
         extracted = 0
         skipped = 0
+        skipped_exist = 0
         try:
             if self.archive_kind == "zip":
                 with zipfile.ZipFile(self.archive_path, 'r') as z:
@@ -1567,6 +1735,11 @@ class M:
                         if not self._is_safe_member(base, name):
                             skipped += 1
                             continue
+                        if not name.endswith('/'):
+                            target_path = base / name
+                            if path_exists_lexists(target_path):
+                                skipped_exist += 1
+                                continue
                         try:
                             z.extract(info, str(base))
                             extracted += 1
@@ -1581,6 +1754,17 @@ class M:
                         if not self._is_safe_member(base, m.name):
                             skipped += 1
                             continue
+                        target_path = base / m.name
+                        if m.isdir():
+                            try:
+                                target_path.mkdir(parents=True, exist_ok=True)
+                                extracted += 1
+                            except Exception:
+                                skipped += 1
+                            continue
+                        if path_exists_lexists(target_path):
+                            skipped_exist += 1
+                            continue
                         try:
                             try:
                                 t.extract(m, str(base), filter='data')
@@ -1590,13 +1774,17 @@ class M:
                         except Exception:
                             skipped += 1
             msg = f"Распаковано: {extracted}"
+            if skipped_exist:
+                msg += f" (пропущено существующих: {skipped_exist})"
             if skipped:
-                msg += f" (пропущено: {skipped})"
+                msg += f" (пропущено небезопасных: {skipped})"
             self.set_message(msg)
         except Exception as e:
             self.set_message(f"Ошибка распаковки: {e}")
         self.refresh_pane(self.active)
         self.mode = self.MODE_FILES
+
+    # ---------------- main loop ----------------
 
     def run(self):
         ensure_directories()
@@ -1672,6 +1860,8 @@ class M:
                     self.set_message(f"Ошибка: {e}")
         finally:
             self.save_config()
+
+    # ---------------- prompts ----------------
 
     def _close_prompt(self):
         self.prompt_active = False
@@ -1750,9 +1940,12 @@ class M:
         elif key == 9:
             self.set_message("Tab недоступен в поле ввода.")
         elif isinstance(key, str):
-            self.prompt_input += key
+            if not (key and ord(key[0]) < 0x20):
+                self.prompt_input += key
         elif isinstance(key, int) and 32 <= key <= 126:
             self.prompt_input += chr(key)
+
+    # ---------------- file manager keys ----------------
 
     def handle_files_key(self, key):
         idx = self.active
@@ -1823,6 +2016,8 @@ class M:
             self.mode = self.MODE_BOOKMARKS
         elif key == ord('R'):
             self.bm_idx = 0
+            self._trash_clear_pending = 0.0
+            self._trash_del_pending = 0.0
             self.mode = self.MODE_TRASH
         elif key == ord('D'):
             self.mode = self.MODE_DASHBOARD
@@ -1854,9 +2049,9 @@ class M:
         return True
 
     def _prompt_delete(self):
+        if self._prune_dead_marks():
+            self.set_message("Часть отметок исчезла и была снята.")
         live = self._live_marks()
-        if not live and self.marked[self.active]:
-            self._prune_dead_marks()
 
         if live:
             n = len(live)
@@ -1925,10 +2120,12 @@ class M:
         if not self.editor_open_file(str(full)):
             self.mode = self.MODE_EDITOR
 
+    # ---------------- file operations ----------------
+
     def do_mkdir(self, name):
         name = name.strip()
-        if not name:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(name):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         try:
             p = self.panes[self.active] / name
@@ -1955,8 +2152,8 @@ class M:
 
     def do_newfile(self, name):
         name = name.strip()
-        if not name:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(name):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         try:
             p = self.panes[self.active] / name
@@ -1983,8 +2180,8 @@ class M:
 
     def do_rename(self, newname):
         newname = newname.strip()
-        if not newname:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(newname):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         entry = self.current_item()
         if entry is None or entry.is_parent:
@@ -2040,6 +2237,7 @@ class M:
             return
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего удалять.")
             return
 
         try:
@@ -2131,10 +2329,11 @@ class M:
         self.refresh_pane(self.active)
 
     def _get_operation_sources(self):
+        if self._prune_dead_marks():
+            self.set_message("Часть отметок исчезла и была снята.")
         live = self._live_marks()
         if live:
             return live
-        self._prune_dead_marks()
         entry = self.current_item()
         if entry is None or entry.is_parent:
             return []
@@ -2143,6 +2342,7 @@ class M:
     def do_move(self):
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего перемещать.")
             return
         dst_dir = self.panes[1 - self.active]
         failed = []
@@ -2197,6 +2397,7 @@ class M:
     def do_copy(self):
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего копировать.")
             return
         dst_dir = self.panes[1 - self.active]
         failed = []
@@ -2213,7 +2414,10 @@ class M:
                 continue
             try:
                 if src.is_dir():
-                    shutil.copytree(src, dst)
+                    shutil.copytree(src, dst, symlinks=True)
+                elif src.is_symlink():
+                    linkto = os.readlink(str(src))
+                    os.symlink(linkto, str(dst))
                 else:
                     shutil.copy2(src, dst)
                 self.hooks.fire("on_create",
@@ -2246,7 +2450,10 @@ class M:
             if path_exists_lexists(dst):
                 raise FileExistsError("цель уже существует")
             if src.is_dir():
-                shutil.copytree(src, dst)
+                shutil.copytree(src, dst, symlinks=True)
+            elif src.is_symlink():
+                linkto = os.readlink(str(src))
+                os.symlink(linkto, str(dst))
             else:
                 shutil.copy2(src, dst)
 
@@ -2299,6 +2506,8 @@ class M:
             self.bookmarks.append(current)
             self.set_message(f"Закладка: {current}")
         self.save_bookmarks()
+
+    # ---------------- tabs ----------------
 
     def _save_tab_state(self):
         tab = self.tabs[self.active_tab]
@@ -2368,6 +2577,8 @@ class M:
         self.refresh_pane(1)
         self.set_message("Вкладка закрыта.")
 
+    # ---------------- editor core ----------------
+
     def _snapshot(self):
         return (list(self.ed_buffer), list(self.ed_cursor), self.ed_modified)
 
@@ -2401,6 +2612,7 @@ class M:
             self.ed_cursor = list(cur)
             self.ed_modified = mod
             self._reset_undo_group()
+            self._ensure_cursor_visible()
             self.set_message("Отменено.")
         else:
             self.set_message("Нечего отменять.")
@@ -2413,6 +2625,7 @@ class M:
             self.ed_cursor = list(cur)
             self.ed_modified = mod
             self._reset_undo_group()
+            self._ensure_cursor_visible()
             self.set_message("Повторено.")
         else:
             self.set_message("Нечего повторять.")
@@ -2423,6 +2636,9 @@ class M:
             return False
         try:
             p = Path(self.ed_filename)
+            if p.is_symlink() and not p.exists():
+                self.set_message("Битый симлинк — сохранение отменено.")
+                return False
             data = "\n".join(self.ed_buffer)
             atomic_write_text(p, data)
             self.ed_modified = False
@@ -2442,6 +2658,21 @@ class M:
         line_len = len(self.ed_buffer[cy])
         cx = max(0, min(cx, line_len))
         self.ed_cursor = [cy, cx]
+        self._ensure_cursor_visible()
+
+    def _ensure_cursor_visible(self):
+        try:
+            h, w = self.stdscr.getmaxyx()
+        except Exception:
+            return
+        visible_h = max(1, h - 3)
+        cur = self.ed_cursor[0]
+        if cur < self.ed_scroll:
+            self.ed_scroll = cur
+        elif cur >= self.ed_scroll + visible_h:
+            self.ed_scroll = cur - visible_h + 1
+        max_scroll = max(0, len(self.ed_buffer) - visible_h)
+        self.ed_scroll = max(0, min(self.ed_scroll, max_scroll))
 
     def handle_editor_key(self, key):
         if key == curses.KEY_F1 or key == 16:
@@ -2523,7 +2754,6 @@ class M:
                 if not self.save_editor():
                     return
             else:
-                # Нечего сохранять — файла нет.
                 self.set_message(
                     "Файл без имени — пропускаю сохранение."
                 )
@@ -2532,7 +2762,6 @@ class M:
     def _editor_exit(self, ans):
         if ans == 'y':
             if not self.ed_filename:
-                # Переспросим: пользователь хотел сохранить, но сохранять некуда.
                 self.ask_yesno(
                     "Файл без имени — сохранить нельзя. "
                     "Выйти без сохранения? [y/д, n/н]: ",
@@ -2620,10 +2849,11 @@ class M:
                 del self.ed_buffer[cy + 1]
                 self.ed_modified = True
         elif isinstance(key, str):
-            line = self.ed_buffer[cy]
-            self.ed_buffer[cy] = line[:cx] + key + line[cx:]
-            self.ed_cursor[1] += len(key)
-            self.ed_modified = True
+            if key and ord(key[0]) >= 0x20 or key == '\t':
+                line = self.ed_buffer[cy]
+                self.ed_buffer[cy] = line[:cx] + key + line[cx:]
+                self.ed_cursor[1] += len(key)
+                self.ed_modified = True
         elif isinstance(key, int) and 32 <= key <= 126:
             line = self.ed_buffer[cy]
             self.ed_buffer[cy] = line[:cx] + chr(key) + line[cx:]
@@ -2697,18 +2927,26 @@ class M:
         if old == new:
             self.set_message("Строки совпадают.")
             return
-        found = any(old in line for line in self.ed_buffer)
-        if not found:
+        total = sum(line.count(old) for line in self.ed_buffer)
+        if total == 0:
             self.set_message("Не найдено.")
             return
         self._push_undo()
         count = 0
         for i, line in enumerate(self.ed_buffer):
             if old in line:
-                count += line.count(old)
                 self.ed_buffer[i] = line.replace(old, new)
+                count += self.ed_buffer[i].count(new) - line.count(old) + line.count(old)
+        # Пересчитаем корректно:
+        count = 0
+        for i, line in enumerate(self.ed_buffer):
+            pass
+        # Простое пересчитывание уже сделано через total; повторное сохранение.
+        for i, line in enumerate(self.ed_buffer):
+            if new and old in line:
+                pass
         self.ed_modified = True
-        self.set_message(f"Заменено вхождений: {count} (Ctrl+Z — отменить)")
+        self.set_message(f"Заменено вхождений: {total} (Ctrl+Z — отменить)")
 
     def editor_open_file(self, path):
         if path is None:
@@ -2758,7 +2996,7 @@ class M:
                 self.ed_buffer = [""]
                 self.set_message(f"Новый файл: {p.name} (Ctrl+S — сохранить)")
                 self.hooks.fire("on_create", path=str(p), kind="file-pending")
-                if p.exists():
+                if p.exists() and p.is_file():
                     try:
                         text = p.read_text(encoding='utf-8', errors='replace')
                         text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -2794,6 +3032,10 @@ class M:
             if ok:
                 self.mode = self.MODE_EDITOR
 
+
+# ---------------------------------------------------------------------------
+# Curses entry
+# ---------------------------------------------------------------------------
 
 def _run_curses(stdscr, safe=False, no_color=False, args=None):
     try:
@@ -2857,9 +3099,14 @@ def main():
         return
     if flag in ("-m", "--mkdir"):
         if len(args) > 1:
+            name = args[1]
             try:
-                Path(args[1]).expanduser().mkdir(parents=True, exist_ok=True)
-                print(f"Папка '{args[1]}' создана.")
+                p = Path(name).expanduser()
+                if path_exists_lexists(p):
+                    print(f"Уже существует: {p}", file=sys.stderr)
+                    sys.exit(1)
+                p.mkdir(parents=True, exist_ok=True)
+                print(f"Папка '{name}' создана.")
             except Exception as e:
                 print(f"Ошибка: {e}", file=sys.stderr)
                 sys.exit(1)
@@ -2872,6 +3119,12 @@ def main():
             try:
                 src = Path(args[1]).expanduser()
                 dst = Path(args[2]).expanduser()
+                if not path_exists_lexists(src):
+                    print(f"Источник не найден: {src}", file=sys.stderr)
+                    sys.exit(1)
+                if path_exists_lexists(dst) and not dst.is_dir():
+                    print(f"Цель уже существует: {dst}", file=sys.stderr)
+                    sys.exit(1)
                 shutil.move(str(src), str(dst))
                 print(f"Перемещено: {args[1]} → {args[2]}")
             except Exception as e:
@@ -2886,8 +3139,17 @@ def main():
             try:
                 src = Path(args[1]).expanduser()
                 dst = Path(args[2]).expanduser()
+                if not path_exists_lexists(src):
+                    print(f"Источник не найден: {src}", file=sys.stderr)
+                    sys.exit(1)
+                if path_exists_lexists(dst) and not dst.is_dir():
+                    print(f"Цель уже существует: {dst}", file=sys.stderr)
+                    sys.exit(1)
                 if src.is_dir():
-                    shutil.copytree(str(src), str(dst))
+                    shutil.copytree(str(src), str(dst), symlinks=True)
+                elif src.is_symlink():
+                    linkto = os.readlink(str(src))
+                    os.symlink(linkto, str(dst))
                 else:
                     shutil.copy2(str(src), str(dst))
                 print(f"Скопировано: {args[1]} → {args[2]}")
