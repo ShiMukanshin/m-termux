@@ -2,29 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.6.2.
+Версия 6.6.4.
 
-Изменения относительно 6.6.1:
-  • _trash_delete_permanent и _trash_clear используют _remove_any —
-    симлинк на каталог больше не валит rmtree.
-  • do_copy и _register_copy_undo: copytree(symlinks=True) и явная
-    обработка симлинка в корне — защита от разыменования и циклов.
-  • Все модальные экраны (trash, archive, bookmarks, hooks) показывают
-    self.message — раньше операции завершались молча.
-  • _is_valid_basename: do_mkdir / do_newfile / do_rename отвергают
-    пустые имена, '.', '..', '/' и '\0'.
-  • atomic_write_text: разрешает симлинк и пишет в цель, не разрушая
-    ссылку (актуально для ~/.m/config.json → ~/dotfiles/...).
-  • _editor_open_confirm: убрано сообщение, мгновенно стиравшееся
-    ask() — если сохранять нечего, диалог открытия вызывается сразу.
-  • _sanitize_display для имён файлов, содержимого и сообщений:
-    управляющие символы (кроме \t) заменяются на '?'.
-  • HookManager._log: ротация лога при достижении 1 МБ.
-  • _unique_trash_path: ограничение попыток 1000 — цикл не может
-    стать бесконечным.
-  • _get_operation_sources: убран побочный эффект мутации marked.
-  • refresh_pane: сообщение при общей OSError, а не тишина.
-  • Статусная строка файлов упоминает r (имя) и q (выход).
+Изменения относительно 6.6.3:
+  • _prompt_delete: сообщение о снятых мёртвых отметках встроено в
+    текст промпта. Раньше оно стиралось ask_yesno до того, как его
+    успевал увидеть пользователь.
+  • _editor_open_confirm: при попытке открыть файл с несохранённым
+    безымянным буфером диалог переспрашивает «открыть без сохранения?»
+    вместо тихого отказа. Раньше пользователь застревал.
+  • _call_timed: устранена гонка между основным потоком и хук-потоком
+    в определении «позднего» завершения. LATE-лог теперь пишется
+    основным потоком после короткой догонки через t.join(0.05),
+    без чтения разделяемого флага из чужого потока.
+  • _get_operation_sources: подчищает мёртвые отметки при отсутствии
+    живых, чтобы marked не накапливал несуществующие пути.
+  • Тексты ошибок в do_mkdir / do_newfile / do_rename синхронизированы
+    с _is_valid_basename: теперь упомянуты управляющие символы.
+  • _extract_archive: задокументировано поведение по умолчанию —
+    существующие файлы перезаписываются.
 """
 
 import curses
@@ -40,11 +36,12 @@ import tempfile
 import time
 import unicodedata
 import threading
+import zlib
 from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.6.2"
+__version__ = "6.6.4"
 
 
 HOME = Path.home()
@@ -104,7 +101,16 @@ def _is_valid_basename(name):
         return False
     if '/' in name or '\0' in name:
         return False
+    for c in name:
+        cp = ord(c)
+        if cp < 0x20 or cp == 0x7f:
+            return False
     return True
+
+
+def _invalid_name_message():
+    return ("Некорректное имя: пустое, '.', '..', содержит '/' или "
+            "управляющие символы.")
 
 
 def atomic_write_text(path, text, encoding="utf-8"):
@@ -241,6 +247,10 @@ class HookManager:
             return None
 
     def _call_timed(self, name, event, fn, kwargs, timeout):
+        # Никаких разделяемых флагов между потоками: основной поток
+        # сам решает, был ли таймаут, по результату done.wait(). После
+        # таймаута — короткая догонка, чтобы поймать «позднее»
+        # завершение и записать LATE-строку одним автором в лог.
         result = [None]
         exc = [None]
         done = threading.Event()
@@ -255,8 +265,17 @@ class HookManager:
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-        if not done.wait(timeout):
+        finished = done.wait(timeout)
+        if not finished:
             self._log(f"TIMEOUT event={event} hook={name} (> {timeout}s)")
+            t.join(0.05)
+            if done.is_set():
+                if exc[0] is not None:
+                    self._log(f"LATE-ERROR event={event} hook={name}: "
+                              f"{type(exc[0]).__name__}: {exc[0]}")
+                else:
+                    self._log(f"LATE event={event} hook={name}: "
+                              f"завершился после таймаута")
             return None
         if exc[0] is not None:
             self._log(f"ERROR event={event} hook={name}: "
@@ -839,7 +858,8 @@ class M:
                         pass
             self._draw_pane(i, x0, width, h)
 
-        status = " Enter:откр m:папка n:новый i:пер c:коп d:удал r:имя e:ред q:выход ?:справка"
+        status = (" Enter:откр m:папка n:файл i:пер c:коп d:удал "
+                  "r:переим e:ред t:вклад R:корз ?:справка q:выход")
 
         if self.prompt_active:
             self._draw_prompt(h, w)
@@ -1030,7 +1050,7 @@ class M:
             except Exception:
                 attr = curses.A_NORMAL
             total = max(0, w - 1)
-            vis = []
+            parts = []
             c = 0
             for ch in line:
                 if ch == '\t':
@@ -1039,10 +1059,14 @@ class M:
                     nxt = c + M._char_width(ch)
                 if nxt > total:
                     break
-                vis.append(ch)
+                if ch == '\t':
+                    parts.append(' ' * (nxt - c))
+                else:
+                    parts.append(ch)
                 c = nxt
-            pad = ' ' * max(0, total - c)
-            text = ''.join(vis) + pad
+            if c < total:
+                parts.append(' ' * (total - c))
+            text = ''.join(parts)
             try:
                 self.stdscr.addstr(y, 0, _sanitize_display(text), attr)
             except Exception:
@@ -1334,11 +1358,15 @@ class M:
             self.addstr(2, 0, " Закладок нет. Нажми 'b' в файловом менеджере.",
                         curses.A_DIM)
         else:
-            for i, bm in enumerate(self.bookmarks):
-                if 2 + i >= h - 2:
-                    break
+            visible = max(1, h - 4)
+            start = 0
+            if self.bm_idx >= visible:
+                start = self.bm_idx - visible + 1
+            end = min(start + visible, len(self.bookmarks))
+            for i in range(start, end):
+                bm = self.bookmarks[i]
                 attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
-                self.addstr(2 + i, 0, f"  {i+1}. {bm}", attr)
+                self.addstr(2 + (i - start), 0, f"  {i+1}. {bm}", attr)
         self.addstr(h - 2, 0, " ↑/↓:выбор  Enter:перейти  d:удалить  Esc:назад ",
                     self.cp(3))
         if self.message:
@@ -1364,6 +1392,9 @@ class M:
             if target.is_dir():
                 self.panes[self.active] = target
                 self.selected[self.active] = 0
+                self.marked[self.active].clear()
+                self.fm_hits = []
+                self.fm_hit_idx = -1
                 self.refresh_pane(self.active)
                 self.set_message(f"Переход: {target}")
                 self.mode = self.MODE_FILES
@@ -1392,11 +1423,15 @@ class M:
         if not items:
             self.addstr(2, 0, " Корзина пуста.", curses.A_DIM)
         else:
-            for i, (name, _meta) in enumerate(items):
-                if 2 + i >= h - 2:
-                    break
+            visible = max(1, h - 4)
+            start = 0
+            if self.bm_idx >= visible:
+                start = self.bm_idx - visible + 1
+            end = min(start + visible, len(items))
+            for i in range(start, end):
+                name, _meta = items[i]
                 attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
-                self.addstr(2 + i, 0, f"  {i+1}. {name}", attr)
+                self.addstr(2 + (i - start), 0, f"  {i+1}. {name}", attr)
 
         self.addstr(h - 2, 0,
                     " ↑/↓:выбор  r:восст.  d:удалить  C:очистить  Esc:назад ",
@@ -1432,7 +1467,7 @@ class M:
                 return []
             items = []
             for p in sorted(TRASH_DIR.iterdir()):
-                if p.name.startswith('.'):
+                if p.name == '.meta.json':
                     continue
                 items.append((p.name, p))
             return items
@@ -1465,7 +1500,7 @@ class M:
     def _unique_trash_path(self, name):
         base = f"{time.time_ns()}"
         if len(name) > TRASH_NAME_LIMIT:
-            suffix = str(abs(hash(name)) % (10 ** 8))
+            suffix = str(zlib.crc32(name.encode("utf-8")) & 0xffffffff)
             name = name[:TRASH_NAME_LIMIT - len(suffix) - 1] + "_" + suffix
         candidate = TRASH_DIR / f"{base}_{name}"
         n = 1
@@ -1481,15 +1516,19 @@ class M:
         try:
             if not p.is_absolute():
                 return False
-            parts = p.parts
+            try:
+                resolved = p.resolve()
+            except (OSError, RuntimeError):
+                return False
+            parts = resolved.parts
             if len(parts) < 3:
                 return False
-            top1 = "/" + parts[1]
-            top2 = "/" + "/".join(parts[1:3])
-            if top1 in _DANGEROUS_RESTORE_PREFIXES:
-                return False
-            if top2 in _DANGEROUS_RESTORE_PREFIXES:
-                return False
+            for prefix in _DANGEROUS_RESTORE_PREFIXES:
+                try:
+                    resolved.relative_to(prefix)
+                    return False
+                except ValueError:
+                    pass
             return True
         except Exception:
             return False
@@ -1522,6 +1561,8 @@ class M:
             meta.pop(name, None)
             self._save_trash_meta(meta)
             self.set_message(f"Восстановлено: {dst}")
+            self.refresh_pane(0)
+            self.refresh_pane(1)
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
 
@@ -1542,7 +1583,7 @@ class M:
         try:
             if TRASH_DIR.exists():
                 for p in list(TRASH_DIR.iterdir()):
-                    if p.name.startswith('.'):
+                    if p.name == '.meta.json':
                         continue
                     _remove_any(p)
                 self._save_trash_meta({})
@@ -1562,11 +1603,18 @@ class M:
         else:
             self.bm_idx = 0
 
-        for i, name in enumerate(self.archive_items):
-            if 2 + i >= h - 2:
-                break
-            attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
-            self.addstr(2 + i, 0, f"  {name[:max(1, w-6)]}", attr)
+        if self.archive_items:
+            visible = max(1, h - 4)
+            start = 0
+            if self.bm_idx >= visible:
+                start = self.bm_idx - visible + 1
+            end = min(start + visible, len(self.archive_items))
+            for i in range(start, end):
+                name = self.archive_items[i]
+                attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
+                self.addstr(2 + (i - start), 0,
+                            f"  {name[:max(1, w-6)]}", attr)
+
         self.addstr(h - 2, 0, " ↑/↓:нав.  x:распаковать всё сюда  Esc:назад ",
                     self.cp(3))
         if self.message:
@@ -1631,6 +1679,12 @@ class M:
             return False
 
     def _extract_archive(self):
+        """Распаковывает архив в текущую папку активной панели.
+
+        Существующие файлы ПЕРЕЗАПИСЫВАЮТСЯ (поведение по умолчанию
+        zipfile.extract / tarfile.extract). Символические и жёсткие
+        ссылки, special-файлы и небезопасные пути пропускаются.
+        """
         if not self.archive_path:
             return
         target = self.panes[self.active]
@@ -1653,7 +1707,8 @@ class M:
             else:
                 with tarfile.open(self.archive_path, 'r:*') as t:
                     for m in t:
-                        if m.issym() or m.islnk() or m.isdev():
+                        if (m.issym() or m.islnk() or m.isdev()
+                                or m.isfifo() or m.ischr() or m.isblk()):
                             skipped += 1
                             continue
                         if not self._is_safe_member(base, m.name):
@@ -1932,13 +1987,19 @@ class M:
         return True
 
     def _prompt_delete(self):
-        if self._prune_dead_marks():
-            self.set_message("Часть отметок исчезла и была снята.")
+        # Мёртвые отметки снимаем до вычисления live. Сообщение об этом
+        # встраиваем в текст промпта: ask_yesno сбрасывает self.message,
+        # поэтому отдельный set_message был бы потерян.
+        pruned = self._prune_dead_marks()
         live = self._live_marks()
 
         if live:
             n = len(live)
-            text = f"Удалить в корзину: {n} шт.? [y/д, n/н]: "
+            if pruned:
+                text = (f"Удалить в корзину: {n} шт. "
+                        f"(часть отметок снята)? [y/д, n/н]: ")
+            else:
+                text = f"Удалить в корзину: {n} шт.? [y/д, n/н]: "
         else:
             entry = self.current_item()
             if entry is None:
@@ -1957,6 +2018,7 @@ class M:
         if entry.is_parent:
             self.panes[self.active] = self.panes[self.active].parent
             self.selected[self.active] = 0
+            self.marked[self.active].clear()
             self.fm_hits = []
             self.fm_hit_idx = -1
             self.refresh_pane(self.active)
@@ -1967,6 +2029,7 @@ class M:
         if full.is_dir():
             self.panes[self.active] = full
             self.selected[self.active] = 0
+            self.marked[self.active].clear()
             self.fm_hits = []
             self.fm_hit_idx = -1
             self.refresh_pane(self.active)
@@ -2006,7 +2069,7 @@ class M:
     def do_mkdir(self, name):
         name = name.strip()
         if not _is_valid_basename(name):
-            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
+            self.set_message(_invalid_name_message())
             return
         try:
             p = self.panes[self.active] / name
@@ -2034,7 +2097,7 @@ class M:
     def do_newfile(self, name):
         name = name.strip()
         if not _is_valid_basename(name):
-            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
+            self.set_message(_invalid_name_message())
             return
         try:
             p = self.panes[self.active] / name
@@ -2062,7 +2125,7 @@ class M:
     def do_rename(self, newname):
         newname = newname.strip()
         if not _is_valid_basename(newname):
-            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
+            self.set_message(_invalid_name_message())
             return
         entry = self.current_item()
         if entry is None or entry.is_parent:
@@ -2213,12 +2276,18 @@ class M:
         live = self._live_marks()
         if live:
             return live
+        # Живых отметок нет — если в marked остались мёртвые, снимаем
+        # их и работаем с элементом под курсором. Так marked не
+        # накапливает несуществующие пути между операциями.
+        if self.marked[self.active]:
+            self._prune_dead_marks()
         entry = self.current_item()
         if entry is None or entry.is_parent:
             return []
         return [entry.path]
 
     def do_move(self):
+        had_marks = bool(self._live_marks())
         sources = self._get_operation_sources()
         if not sources:
             self.set_message("Нечего перемещать.")
@@ -2247,13 +2316,17 @@ class M:
                 last_error = f"Ошибка: {e}"
                 failed.append(src)
 
-        m = self.marked[self.active]
+        if had_marks:
+            m = self.marked[self.active]
+            if failed:
+                m.clear()
+                m.update(str(p) for p in failed)
+            else:
+                m.clear()
+
         if failed:
-            m.clear()
-            m.update(str(p) for p in failed)
             self.set_message(last_error or "Некоторые файлы не перемещены.")
         else:
-            m.clear()
             self.set_message(f"Перемещено: {success}. (u — отменить)")
         self.refresh_pane(0)
         self.refresh_pane(1)
@@ -2283,6 +2356,7 @@ class M:
             shutil.copy2(str(src), str(dst))
 
     def do_copy(self):
+        had_marks = bool(self._live_marks())
         sources = self._get_operation_sources()
         if not sources:
             self.set_message("Нечего копировать.")
@@ -2311,13 +2385,17 @@ class M:
                 last_error = f"Ошибка: {e}"
                 failed.append(src)
 
-        m = self.marked[self.active]
+        if had_marks:
+            m = self.marked[self.active]
+            if failed:
+                m.clear()
+                m.update(str(p) for p in failed)
+            else:
+                m.clear()
+
         if failed:
-            m.clear()
-            m.update(str(p) for p in failed)
             self.set_message(last_error or "Некоторые файлы не скопированы.")
         else:
-            m.clear()
             self.set_message(f"Скопировано: {success}. (u — отменить)")
         self.refresh_pane(0)
         self.refresh_pane(1)
@@ -2604,10 +2682,25 @@ class M:
             self.clamp_cursor()
 
     def _editor_open_confirm(self, ans):
-        if ans == 'y' and self.ed_filename:
+        # Если ans='y' и нет имени файла — сохранять некуда. Спрашиваем
+        # разрешение открыть файл без сохранения, чтобы пользователь
+        # не застревал в тупике «ответьте n», как раньше.
+        if ans == 'y':
+            if not self.ed_filename:
+                self.ask_yesno(
+                    "Файл без имени. Открыть без сохранения? [y/д, n/н]: ",
+                    self._editor_open_nosave,
+                )
+                return
             if not self.save_editor():
                 return
         self.ask("Открыть файл: ", self.editor_open_file)
+
+    def _editor_open_nosave(self, ans):
+        if ans == 'y':
+            self.ask("Открыть файл: ", self.editor_open_file)
+        else:
+            self.set_message("Отменено — остаёмся в редакторе.")
 
     def _editor_exit(self, ans):
         if ans == 'y':
@@ -2873,6 +2966,11 @@ class M:
                 ok = not self.editor_open_file(str(cwd / "untitled.txt"))
             if ok:
                 self.mode = self.MODE_EDITOR
+                if len(args) > 2:
+                    extra = " ".join(args[2:])
+                    self.set_message(
+                        f"Проигнорированы лишние аргументы: {extra}"
+                    )
 
 
 def _run_curses(stdscr, safe=False, no_color=False, args=None):
