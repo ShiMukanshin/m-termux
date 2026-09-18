@@ -2,16 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.7.
+Версия 6.5.8.
 
-Изменения относительно 6.5.6:
-  • do_rename переносит отметку со старого пути на новый — после
-    переименования помеченного файла следующая d/c/i не падает.
-  • editor_open_file на пустом вводе ставит сообщение и оставляет
-    промпт открытым.
+Изменения относительно 6.5.7:
+  • do_rename.undo/redo синхронизируют marked. Раньше после undo
+    переименованного помеченного файла множество marked содержало
+    старый путь — следующая d/c/i падала на несуществующем пути.
+  • _get_operation_sources отбрасывает несуществующие пути из marked.
+    Защита от «мёртвых» отметок после внешнего удаления или undo.
+  • refresh_pane различает FileNotFoundError и PermissionError —
+    пользователь видит причину, а не пустую панель.
+
+Базовые изменения 6.5.7 (сохранены):
+  • do_rename переносит отметку с старого пути на новый.
+  • editor_open_file на пустом вводе: сообщение + промпт остаётся.
   • _prompt_delete различает entry is None и entry.is_parent.
-  • run() в try/finally: save_config() вызывается и при Ctrl+C
-    в модальных экранах.
+  • run() в try/finally: save_config() и при Ctrl+C в модалках.
   • _close_prompt сбрасывает prompt_text.
 """
 
@@ -32,7 +38,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.7"
+__version__ = "6.5.8"
 
 
 HOME = Path.home()
@@ -626,6 +632,8 @@ class M:
             info.sort(key=lambda t: (not t[1], t[0].name.lower()))
             for p, is_dir in info:
                 entries.append(_Entry(p, p.name, is_dir, False))
+        except FileNotFoundError:
+            self.set_message(f"Каталог не найден: {base}")
         except PermissionError:
             self.set_message(f"Нет доступа: {base}")
         except Exception:
@@ -1963,12 +1971,19 @@ class M:
             def undo():
                 if dst.exists() and not src.exists():
                     dst.rename(src)
+                    # Синхронизируем метку: файл вернулся под старым именем.
+                    if new_s in self.marked[self.active]:
+                        self.marked[self.active].discard(new_s)
+                        self.marked[self.active].add(old_s)
                 else:
                     raise OSError("невозможно откатить")
 
             def redo():
                 if src.exists() and not dst.exists():
                     src.rename(dst)
+                    if old_s in self.marked[self.active]:
+                        self.marked[self.active].discard(old_s)
+                        self.marked[self.active].add(new_s)
                 else:
                     raise OSError("невозможно повторить")
 
@@ -2074,8 +2089,17 @@ class M:
         self.refresh_pane(self.active)
 
     def _get_operation_sources(self):
+        """
+        Источники для i/c/d: помеченные файлы или текущий элемент.
+        Из marked отбрасываются несуществующие пути — файл мог быть
+        переименован через undo/redo, удалён внешним процессом и т. п.
+        """
         if self.marked[self.active]:
-            return [Path(p) for p in self.marked[self.active]]
+            alive = [p for p in self.marked[self.active] if Path(p).exists()]
+            if alive:
+                return [Path(p) for p in alive]
+            # Все отметки мертвы — сбрасываем и падаем на текущий курсор.
+            self.marked[self.active].clear()
         entry = self.current_item()
         if entry is None or entry.is_parent:
             return []
