@@ -3,7 +3,7 @@
 > Двухпанельный файловый менеджер + редактор + куча утилит «всё в одном».
 > Только стандартная библиотека Python. Mobile-first.
 
-![version](https://img.shields.io/badge/version-6.6.1lred) 
+![version](https://img.shields.io/badge/version-6.6.2-red) 
 ![python](https://img.shields.io/badge/python-3.8%2B-green) 
 ![license](https://img.shields.io/badge/license-MIT-lightgrey) 
 ![platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS%20%7C%20WSL-orange)

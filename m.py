@@ -2,27 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.6.1.
+Версия 6.6.2.
 
-Изменения относительно 6.5.10:
-  • do_rename: проверка целевого имени через path_exists_lexists.
-    Раньше битый симлинк на месте dst молча затирался src.rename.
-  • do_mkdir / do_newfile: та же защита — битый симлинк с таким
-    именем теперь блокирует создание.
-  • _unique_trash_path: path_exists_lexists — коллизия с битым
-    симлинком в корзине больше не приводит к его замене.
-  • _editor_exit / _editor_open_confirm: корректная обработка
-    случая «файл без имени + ответ y». Раньше ставилось сообщение
-    «Ответьте n», но промпт уже был закрыт — выйти было некуда.
-    Теперь _editor_exit в этом случае переспрашивает «выйти без
-    сохранения?»; _editor_open_confirm сообщает, что сохранять
-    нечего, и переходит к диалогу открытия.
-  • editor_open_file: явный отказ на битый симлинк (раньше считался
-    «новым файлом» и сохранение уничтожило бы симлинк).
-    Сообщение при пустом пути нейтральное — «Пустой путь — отменено».
-  • open_in_editor: явный отказ на битый симлинк.
-  • _get_operation_sources / _prompt_delete: убрана неявная мутация
-    marked — вынесена в _prune_dead_marks.
+Изменения относительно 6.6.1:
+  • _trash_delete_permanent и _trash_clear используют _remove_any —
+    симлинк на каталог больше не валит rmtree.
+  • do_copy и _register_copy_undo: copytree(symlinks=True) и явная
+    обработка симлинка в корне — защита от разыменования и циклов.
+  • Все модальные экраны (trash, archive, bookmarks, hooks) показывают
+    self.message — раньше операции завершались молча.
+  • _is_valid_basename: do_mkdir / do_newfile / do_rename отвергают
+    пустые имена, '.', '..', '/' и '\0'.
+  • atomic_write_text: разрешает симлинк и пишет в цель, не разрушая
+    ссылку (актуально для ~/.m/config.json → ~/dotfiles/...).
+  • _editor_open_confirm: убрано сообщение, мгновенно стиравшееся
+    ask() — если сохранять нечего, диалог открытия вызывается сразу.
+  • _sanitize_display для имён файлов, содержимого и сообщений:
+    управляющие символы (кроме \t) заменяются на '?'.
+  • HookManager._log: ротация лога при достижении 1 МБ.
+  • _unique_trash_path: ограничение попыток 1000 — цикл не может
+    стать бесконечным.
+  • _get_operation_sources: убран побочный эффект мутации marked.
+  • refresh_pane: сообщение при общей OSError, а не тишина.
+  • Статусная строка файлов упоминает r (имя) и q (выход).
 """
 
 import curses
@@ -42,7 +44,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.6.1"
+__version__ = "6.6.2"
 
 
 HOME = Path.home()
@@ -69,6 +71,8 @@ MAX_EDITOR_FILE = 10 * 1024 * 1024
 HOOK_TIMEOUT = 2.0
 HOOK_TIMEOUT_BATCH = 0.3
 TRASH_SAVE_EVERY = 10
+LOG_MAX_SIZE = 1_000_000
+TRASH_NAME_LIMIT = 200
 
 _Entry = namedtuple("_Entry", ["path", "name", "is_dir", "is_parent"])
 
@@ -80,8 +84,39 @@ _DANGEROUS_RESTORE_PREFIXES = {
 }
 
 
+def _sanitize_display(s):
+    if not s:
+        return s
+    out = None
+    for i, c in enumerate(s):
+        cp = ord(c)
+        if c != '\t' and (cp < 0x20 or cp == 0x7f):
+            if out is None:
+                out = list(s[:i])
+            out.append('?')
+        elif out is not None:
+            out.append(c)
+    return ''.join(out) if out is not None else s
+
+
+def _is_valid_basename(name):
+    if not name or name in ('.', '..'):
+        return False
+    if '/' in name or '\0' in name:
+        return False
+    return True
+
+
 def atomic_write_text(path, text, encoding="utf-8"):
     path = Path(path)
+
+    if path.is_symlink():
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as e:
+            raise OSError(f"Не удалось разрешить симлинк {path}: {e}")
+        path = resolved
+
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -181,6 +216,17 @@ class HookManager:
         try:
             ensure_directories()
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                if HOOKS_LOG.exists() and HOOKS_LOG.stat().st_size > LOG_MAX_SIZE:
+                    old = HOOKS_LOG.with_suffix(".log.old")
+                    try:
+                        if old.exists():
+                            old.unlink()
+                    except OSError:
+                        pass
+                    os.replace(str(HOOKS_LOG), str(old))
+            except OSError:
+                pass
             with open(HOOKS_LOG, "a", encoding="utf-8") as fh:
                 fh.write(f"[{ts}] {msg}\n")
         except Exception:
@@ -554,7 +600,6 @@ class M:
         self._reset_undo_group()
 
     def _get_key(self):
-        ch = None
         try:
             ch = self.stdscr.get_wch()
         except AttributeError:
@@ -659,8 +704,8 @@ class M:
             self.set_message(f"Каталог не найден: {base}")
         except PermissionError:
             self.set_message(f"Нет доступа: {base}")
-        except Exception:
-            pass
+        except OSError as e:
+            self.set_message(f"Ошибка чтения {base}: {e}")
         self.items[idx] = entries
 
         if self.selected[idx] >= len(self.items[idx]):
@@ -680,8 +725,12 @@ class M:
             if y < 0 or y >= h or x < 0 or x >= w:
                 return
             s = str(text)
+            if not s:
+                return
+            s = _sanitize_display(s)
+
             avail = w - x - 1
-            if avail <= 0 or not s:
+            if avail <= 0:
                 return
 
             if s.isascii() and '\t' not in s:
@@ -697,12 +746,17 @@ class M:
             for ch in s:
                 if ch == '\t':
                     nxt = ((col // TABSTOP) + 1) * TABSTOP
+                    if nxt > max_col:
+                        break
+                    out.append(' ' * (nxt - col))
+                    col = nxt
                 else:
-                    nxt = col + M._char_width(ch)
-                if nxt > max_col:
-                    break
-                out.append(ch)
-                col = nxt
+                    cw = M._char_width(ch)
+                    nxt = col + cw
+                    if nxt > max_col:
+                        break
+                    out.append(ch)
+                    col = nxt
             if out:
                 self.stdscr.addstr(y, x, ''.join(out), attr)
         except Exception:
@@ -717,7 +771,7 @@ class M:
             pass
 
     def set_message(self, msg):
-        self.message = msg
+        self.message = _sanitize_display(str(msg)) if msg else ""
 
     def _is_archive_name(self, name):
         n = name.lower()
@@ -745,6 +799,8 @@ class M:
         else:
             prompt_line = f" {self.prompt_text}{self.prompt_input}"
             self._set_cursor_visible(True)
+
+        prompt_line = _sanitize_display(prompt_line)
 
         if self.message:
             self.addstr(h - 2, 0, prompt_line, self.cp(3, curses.A_BOLD))
@@ -783,7 +839,7 @@ class M:
                         pass
             self._draw_pane(i, x0, width, h)
 
-        status = " Enter:откр m:папка n:next/новый i:пер c:коп d:удал e:ред ?:спр "
+        status = " Enter:откр m:папка n:новый i:пер c:коп d:удал r:имя e:ред q:выход "
 
         if self.prompt_active:
             self._draw_prompt(h, w)
@@ -838,6 +894,8 @@ class M:
 
         visible_h = max(1, h - 3)
 
+        if not self.ed_buffer:
+            self.ed_buffer = [""]
         if self.ed_cursor[0] < 0:
             self.ed_cursor[0] = 0
         if self.ed_cursor[0] >= len(self.ed_buffer):
@@ -893,7 +951,8 @@ class M:
                     base = line[base_idx]
                     base_vcol = self._visual_col(line, base_idx)
                     try:
-                        self.stdscr.addstr(screen_y, base_vcol, base,
+                        self.stdscr.addstr(screen_y, base_vcol,
+                                           _sanitize_display(base),
                                            curses.A_REVERSE | curses.A_BOLD)
                     except Exception:
                         pass
@@ -901,7 +960,10 @@ class M:
                 else:
                     vcol = self._visual_col(line, cx)
                     ch_w = max(1, self._char_width(ch))
-                    display_ch = " " if ch == "\t" else ch
+                    if ch == "\t":
+                        display_ch = " "
+                    else:
+                        display_ch = _sanitize_display(ch)
                     if vcol + ch_w <= w - 1:
                         try:
                             self.stdscr.addstr(screen_y, vcol, display_ch,
@@ -982,7 +1044,7 @@ class M:
             pad = ' ' * max(0, total - c)
             text = ''.join(vis) + pad
             try:
-                self.stdscr.addstr(y, 0, text, attr)
+                self.stdscr.addstr(y, 0, _sanitize_display(text), attr)
             except Exception:
                 pass
 
@@ -1155,9 +1217,11 @@ class M:
             for err in self.hooks.errors[:8]:
                 if y >= h - 3:
                     break
-                self.addstr(y, 0, f"   ! {err[:w-6]}", self.cp(4))
+                self.addstr(y, 0, f"   ! {err[:max(1, w-6)]}", self.cp(4))
                 y += 1
         self.addstr(h - 2, 0, " R:перезагрузить  любая:назад ", self.cp(3))
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
         try:
@@ -1277,6 +1341,8 @@ class M:
                 self.addstr(2 + i, 0, f"  {i+1}. {bm}", attr)
         self.addstr(h - 2, 0, " ↑/↓:выбор  Enter:перейти  d:удалить  Esc:назад ",
                     self.cp(3))
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
 
@@ -1295,19 +1361,22 @@ class M:
             self.bm_idx = max(0, self.bm_idx - 1)
         elif k in (10, 13, curses.KEY_ENTER) and self.bookmarks:
             target = Path(self.bookmarks[self.bm_idx])
-            if target.exists():
+            if target.is_dir():
                 self.panes[self.active] = target
                 self.selected[self.active] = 0
                 self.refresh_pane(self.active)
                 self.set_message(f"Переход: {target}")
+                self.mode = self.MODE_FILES
+            elif target.exists():
+                self.set_message("Это файл, а не папка.")
             else:
                 self.set_message("Путь больше не существует.")
-            self.mode = self.MODE_FILES
         elif k == ord('d') and self.bookmarks:
             self.bookmarks.pop(self.bm_idx)
             self.save_bookmarks()
             if self.bm_idx >= len(self.bookmarks):
                 self.bm_idx = max(0, len(self.bookmarks) - 1)
+            self.set_message("Закладка удалена.")
 
     def draw_trash(self):
         self.stdscr.erase()
@@ -1332,6 +1401,8 @@ class M:
         self.addstr(h - 2, 0,
                     " ↑/↓:выбор  r:восст.  d:удалить  C:очистить  Esc:назад ",
                     self.cp(3))
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
 
@@ -1393,9 +1464,14 @@ class M:
 
     def _unique_trash_path(self, name):
         base = f"{time.time_ns()}"
+        if len(name) > TRASH_NAME_LIMIT:
+            suffix = str(abs(hash(name)) % (10 ** 8))
+            name = name[:TRASH_NAME_LIMIT - len(suffix) - 1] + "_" + suffix
         candidate = TRASH_DIR / f"{base}_{name}"
         n = 1
         while path_exists_lexists(candidate):
+            if n > 1000:
+                raise OSError("Не удалось подобрать уникальное имя в корзине")
             candidate = TRASH_DIR / f"{base}_{n}_{name}"
             n += 1
         return candidate
@@ -1490,9 +1566,11 @@ class M:
             if 2 + i >= h - 2:
                 break
             attr = self.cp(5) if i == self.bm_idx else curses.A_NORMAL
-            self.addstr(2 + i, 0, f"  {name[:w-6]}", attr)
+            self.addstr(2 + i, 0, f"  {name[:max(1, w-6)]}", attr)
         self.addstr(h - 2, 0, " ↑/↓:нав.  x:распаковать всё сюда  Esc:назад ",
                     self.cp(3))
+        if self.message:
+            self.addstr(h - 1, 0, self.message, self.cp(4))
         self._set_cursor_visible(False)
         self.stdscr.refresh()
 
@@ -1854,9 +1932,9 @@ class M:
         return True
 
     def _prompt_delete(self):
+        if self._prune_dead_marks():
+            self.set_message("Часть отметок исчезла и была снята.")
         live = self._live_marks()
-        if not live and self.marked[self.active]:
-            self._prune_dead_marks()
 
         if live:
             n = len(live)
@@ -1927,8 +2005,8 @@ class M:
 
     def do_mkdir(self, name):
         name = name.strip()
-        if not name:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(name):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         try:
             p = self.panes[self.active] / name
@@ -1955,8 +2033,8 @@ class M:
 
     def do_newfile(self, name):
         name = name.strip()
-        if not name:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(name):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         try:
             p = self.panes[self.active] / name
@@ -1983,8 +2061,8 @@ class M:
 
     def do_rename(self, newname):
         newname = newname.strip()
-        if not newname:
-            self.set_message("Отменено (пустое имя).")
+        if not _is_valid_basename(newname):
+            self.set_message("Некорректное имя (пустое, '.', '..' или с '/').")
             return
         entry = self.current_item()
         if entry is None or entry.is_parent:
@@ -2040,6 +2118,7 @@ class M:
             return
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего удалять.")
             return
 
         try:
@@ -2134,7 +2213,6 @@ class M:
         live = self._live_marks()
         if live:
             return live
-        self._prune_dead_marks()
         entry = self.current_item()
         if entry is None or entry.is_parent:
             return []
@@ -2143,6 +2221,7 @@ class M:
     def do_move(self):
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего перемещать.")
             return
         dst_dir = self.panes[1 - self.active]
         failed = []
@@ -2194,9 +2273,19 @@ class M:
 
         self.undo.push(f"перемещение '{src.name}'", undo, redo)
 
+    def _copy_one(self, src, dst):
+        if src.is_symlink():
+            linkto = os.readlink(str(src))
+            os.symlink(linkto, str(dst))
+        elif src.is_dir():
+            shutil.copytree(str(src), str(dst), symlinks=True)
+        else:
+            shutil.copy2(str(src), str(dst))
+
     def do_copy(self):
         sources = self._get_operation_sources()
         if not sources:
+            self.set_message("Нечего копировать.")
             return
         dst_dir = self.panes[1 - self.active]
         failed = []
@@ -2212,10 +2301,7 @@ class M:
                 failed.append(src)
                 continue
             try:
-                if src.is_dir():
-                    shutil.copytree(src, dst)
-                else:
-                    shutil.copy2(src, dst)
+                self._copy_one(src, dst)
                 self.hooks.fire("on_create",
                                 timeout=hook_timeout,
                                 path=str(dst), kind="copy")
@@ -2245,10 +2331,7 @@ class M:
         def redo():
             if path_exists_lexists(dst):
                 raise FileExistsError("цель уже существует")
-            if src.is_dir():
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
+            self._copy_one(src, dst)
 
         self.undo.push(f"копирование '{src.name}'", undo, redo)
 
@@ -2423,6 +2506,9 @@ class M:
             return False
         try:
             p = Path(self.ed_filename)
+            if p.is_symlink() and not p.exists():
+                self.set_message("Битый симлинк — сохранение отменено.")
+                return False
             data = "\n".join(self.ed_buffer)
             atomic_write_text(p, data)
             self.ed_modified = False
@@ -2518,21 +2604,14 @@ class M:
             self.clamp_cursor()
 
     def _editor_open_confirm(self, ans):
-        if ans == 'y':
-            if self.ed_filename:
-                if not self.save_editor():
-                    return
-            else:
-                # Нечего сохранять — файла нет.
-                self.set_message(
-                    "Файл без имени — пропускаю сохранение."
-                )
+        if ans == 'y' and self.ed_filename:
+            if not self.save_editor():
+                return
         self.ask("Открыть файл: ", self.editor_open_file)
 
     def _editor_exit(self, ans):
         if ans == 'y':
             if not self.ed_filename:
-                # Переспросим: пользователь хотел сохранить, но сохранять некуда.
                 self.ask_yesno(
                     "Файл без имени — сохранить нельзя. "
                     "Выйти без сохранения? [y/д, n/н]: ",
@@ -2620,10 +2699,11 @@ class M:
                 del self.ed_buffer[cy + 1]
                 self.ed_modified = True
         elif isinstance(key, str):
-            line = self.ed_buffer[cy]
-            self.ed_buffer[cy] = line[:cx] + key + line[cx:]
-            self.ed_cursor[1] += len(key)
-            self.ed_modified = True
+            if key:
+                line = self.ed_buffer[cy]
+                self.ed_buffer[cy] = line[:cx] + key + line[cx:]
+                self.ed_cursor[1] += len(key)
+                self.ed_modified = True
         elif isinstance(key, int) and 32 <= key <= 126:
             line = self.ed_buffer[cy]
             self.ed_buffer[cy] = line[:cx] + chr(key) + line[cx:]
@@ -2758,7 +2838,7 @@ class M:
                 self.ed_buffer = [""]
                 self.set_message(f"Новый файл: {p.name} (Ctrl+S — сохранить)")
                 self.hooks.fire("on_create", path=str(p), kind="file-pending")
-                if p.exists():
+                if p.exists() and p.is_file():
                     try:
                         text = p.read_text(encoding='utf-8', errors='replace')
                         text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -2886,8 +2966,11 @@ def main():
             try:
                 src = Path(args[1]).expanduser()
                 dst = Path(args[2]).expanduser()
-                if src.is_dir():
-                    shutil.copytree(str(src), str(dst))
+                if src.is_symlink():
+                    linkto = os.readlink(str(src))
+                    os.symlink(linkto, str(dst))
+                elif src.is_dir():
+                    shutil.copytree(str(src), str(dst), symlinks=True)
                 else:
                     shutil.copy2(str(src), str(dst))
                 print(f"Скопировано: {args[1]} → {args[2]}")
