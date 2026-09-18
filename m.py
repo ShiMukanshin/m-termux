@@ -2,30 +2,34 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.1 — исправления по итогам ревью 6.5.0.
+Версия 6.5.2 — исправление регресса в редакторе и укрепление корзины.
 
-Изменения относительно 6.5.0:
-  • КРИТИЧНО: _is_safe_restore_path больше не блокирует Termux home.
-    В 6.5.0 в forbidden входил '/data', из-за чего файлы из
-    /data/data/com.termux/files/home нельзя было восстановить из
-    корзины. Теперь проверяются конкретные системные директории
-    ('/etc', '/bin', '/usr/bin', '/proc', ...), а '/data' разрешён.
-  • open_in_editor()/apply_flags() проверяют возврат editor_open_file:
-    при ошибке (папка, слишком большой файл, ошибка чтения) режим
-    НЕ переключается, пользователь видит причину.
-  • on_file_change добавлен в TIMEOUT_EVENTS — хук с сетью больше
-    не морозит редактор при открытии файла.
-  • do_delete теперь массовый: если есть помеченные — удаляются все,
-    как в do_copy/do_move. Промпт показывает имя файла или количество.
-  • atomic_write_text использует tempfile.NamedTemporaryFile —
-    исключены коллизии с чужим '.m.tmp' рядом.
-  • _draw_highlighted_line строит таблицу char→col один раз —
-    линейно по длине строки вместо O(n²) на спанах.
-  • ask_yesno принимает hint — подсказка [y/д, n/н] в строке.
-  • Отрисовка промпта унифицирована через _draw_prompt для
-    файлов и редактора (поведение согласовано).
-  • Мелочи: сохранение показывается один раз (в файлах и редакторе),
-    явный return False в конце editor_open_file.
+Изменения относительно 6.5.1:
+  • КРИТИЧНО: draw_editor больше не затирает строку промпта статусом.
+    В 6.5.1 после Ctrl+O в редакторе статусбар рисовался поверх
+    строки ввода — пользователь не видел, куда печатать.
+  • do_delete: undo/redo оборачивают сохранение meta в try/finally —
+    частично восстановленные файлы больше не «висят» в метаданных.
+  • do_delete: метаданные сохраняются каждые 10 удалений — краш на
+    середине массового удаления не оставляет сирот.
+  • _DANGEROUS_RESTORE_PREFIXES расширен: /system, /vendor, /product,
+    /odm, /apex, /var. Termux home (/data/...) по-прежнему разрешён.
+  • atomic_write_text: fd закрывается при сбое os.fdopen.
+  • _draw_prompt: убран неиспользуемый параметр message_line.
+  • Шапка: убрано неверное утверждение про ask_yesno(hint).
+  • editor_open_file: on_open теперь стреляет до on_file_change
+    (семантически верный порядок).
+
+Базовые изменения 6.5.1 (сохранены):
+  • _is_safe_restore_path больше не блокирует Termux home.
+  • open_in_editor()/apply_flags() проверяют возврат editor_open_file.
+  • on_file_change в TIMEOUT_EVENTS.
+  • do_delete массовый: с учётом отметок.
+  • atomic_write_text через tempfile.mkstemp.
+  • _draw_highlighted_line строит таблицу char→col один раз.
+  • ask_yesno: подсказка [y/д, n/н] в тексте промпта.
+  • Отрисовка промпта унифицирована через _draw_prompt.
+  • Явный return False в конце editor_open_file.
 """
 
 import curses
@@ -45,7 +49,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.1"
+__version__ = "6.5.2"
 
 
 # ============================ ПУТИ ============================
@@ -74,17 +78,22 @@ TABSTOP = 8
 
 MAX_EDITOR_FILE = 10 * 1024 * 1024  # 10 MB
 HOOK_TIMEOUT = 2.0  # seconds
+TRASH_SAVE_EVERY = 10  # периодичность сохранения meta при массовом удалении
 
 # Единица списка панели
 _Entry = namedtuple("_Entry", ["path", "name", "is_dir", "is_parent"])
 
 # Точный набор опасных для восстановления директорий.
 # Обрати внимание: '/data' НЕ входит — там живёт Termux home.
-# '/usr/bin' и '/usr/sbin' запрещены отдельно (см. _is_safe_restore_path).
+# '/system', '/vendor', '/product', '/odm', '/apex' — Android-разделы,
+# защищаемся даже несмотря на EROFS.
 _DANGEROUS_RESTORE_PREFIXES = {
+    # Linux / Unix
     "/etc", "/bin", "/sbin", "/boot", "/root",
     "/lib", "/lib64", "/usr/bin", "/usr/sbin", "/usr/lib",
-    "/proc", "/sys", "/dev",
+    "/proc", "/sys", "/dev", "/var",
+    # Android
+    "/system", "/vendor", "/product", "/odm", "/apex",
 }
 
 
@@ -95,14 +104,15 @@ def atomic_write_text(path, text, encoding="utf-8"):
     затем os.replace. Падение процесса в момент записи не оставит
     обрезанный целевой файл.
 
-    Использует tempfile.NamedTemporaryFile — исключены коллизии с
-    чужим файлом '...m.tmp' рядом с целевым.
+    Использует tempfile.mkstemp — коллизии с чужим '.m.tmp' исключены.
+    fd корректно закрывается даже при сбое os.fdopen.
 
     Бросает исключение при ошибке — вызывающий код решает, что делать.
     """
     path = Path(path)
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
+
     fd, tmp_name = tempfile.mkstemp(
         prefix="." + path.name + ".",
         suffix=".m.tmp",
@@ -113,6 +123,11 @@ def atomic_write_text(path, text, encoding="utf-8"):
             fh.write(text)
         os.replace(tmp_name, str(path))
     except Exception:
+        # Страховка: если os.fdopen не успел взять владение fd — закрыть.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(tmp_name)
         except OSError:
@@ -632,7 +647,7 @@ class M:
         """
         Таблица: для каждого индекса символа — его визуальная колонка.
         Длина = len(line)+1, последний элемент — визуальная ширина строки.
-        Линейно по длине строки, кэширует O(n²) в _draw_highlighted_line.
+        Линейно по длине строки, устраняет O(n²) в _draw_highlighted_line.
         """
         table = [0] * (len(line) + 1)
         col = 0
@@ -747,11 +762,16 @@ class M:
         return curses.A_NORMAL
 
     # ==================== ОТРИСОВКА ПРОМПТА (ОБЩАЯ) ====================
-    def _draw_prompt(self, h, w, message_line=None):
+    def _draw_prompt(self, h, w):
         """
-        Универсальная отрисовка активного промпта.
-        message_line — текст, показываемый вместо статуса при наличии
-        сообщения (если None, статус не рисуется).
+        Универсальная отрисовка активного промпта (файлы и редактор).
+
+        Раскладка:
+          • если есть self.message — промпт на h-2, сообщение на h-1;
+          • иначе — только промпт на h-1.
+
+        Статусбар при активном промпте НЕ рисуется — он конфликтует
+        со строкой ввода. Это ответственность вызывающего кода.
         """
         if self.prompt_yesno:
             prompt_line = f" {self.prompt_text}"
@@ -946,11 +966,10 @@ class M:
                   "^W:слово ^R:замена ^X:выход ^P:справка ")
 
         if self.prompt_active:
+            # Промпт занимает нижние строки — статус НЕ рисуем, иначе
+            # затрём строку ввода (регресс 6.5.1). _draw_prompt сам
+            # решает, куда положить prompt и message.
             self._draw_prompt(h, w)
-            # статус в редакторе рисуется только когда нет промпта и нет
-            # сообщения — иначе он мешает строке промпта
-            if not self.message:
-                self.addstr(h - 1, 0, status, self.cp(3))
         else:
             self.addstr(h - 1, 0, status, self.cp(3))
             if self.message:
@@ -1011,6 +1030,7 @@ class M:
             except Exception:
                 pass
 
+        # Внешний спан побеждает вложенный.
         spans = sorted(normal_spans, key=lambda s: (s[0], -s[1]))
         cleaned = []
         last_end = 0
@@ -1420,7 +1440,7 @@ class M:
 
         Разрешаем восстановление в абсолютный путь, кроме:
           • корня ФС и слишком коротких путей (< 3 компонент);
-          • явно системных директорий ('/etc', '/bin', '/usr/bin', ...).
+          • явно системных директорий — Linux и Android.
 
         ВАЖНО: '/data' НЕ в списке — на Termux в /data/data/com.termux/
         находится и home, и префикс. Заблокировать его = сломать корзину.
@@ -1700,7 +1720,10 @@ class M:
         self.message = ""
 
     def ask_yesno(self, text, callback):
-        """Модальный диалог y/n. Callback получает 'y' или 'n'."""
+        """
+        Модальный диалог y/n. Callback получает 'y' или 'n'.
+        Подсказку [y/д, n/н] включай прямо в text — отдельного параметра нет.
+        """
         self.prompt_active = True
         self.prompt_yesno = True
         self.prompt_text = text
@@ -2019,7 +2042,13 @@ class M:
             self.set_message(f"Ошибка: {e}")
 
     def do_delete(self, answer):
-        """Массовое удаление с учётом отметок, как в do_copy/do_move."""
+        """
+        Массовое удаление с учётом отметок, как в do_copy/do_move.
+
+        Устойчивость к крашу: метаданные корзины сохраняются каждые
+        TRASH_SAVE_EVERY успешных перемещений. Undo/redo сохраняют meta
+        в finally — частично восстановленные файлы не остаются сиротами.
+        """
         if answer != 'y':
             self.set_message("Отменено.")
             return
@@ -2037,6 +2066,7 @@ class M:
         pairs = []  # (src, trashed)
         failed = 0
         last_error = ""
+        moved_since_save = 0
 
         for src in sources:
             try:
@@ -2044,11 +2074,19 @@ class M:
                 shutil.move(str(src), str(trashed))
                 meta[trashed.name] = str(src)
                 pairs.append((src, trashed))
-                self.hooks.fire("on_delete", path=str(src))
+                moved_since_save += 1
+                if moved_since_save >= TRASH_SAVE_EVERY:
+                    self._save_trash_meta(meta)
+                    moved_since_save = 0
             except Exception as e:
                 failed += 1
                 last_error = f"Ошибка: {e}"
+                continue
+            # Хук стреляет после того, как файл уже в meta и (возможно)
+            # на диске. Падение хука на удаление не влияет.
+            self.hooks.fire("on_delete", path=str(src))
 
+        # Финальный flush (идемпотентно — если уже сохранено выше).
         if pairs:
             self._save_trash_meta(meta)
 
@@ -2056,28 +2094,38 @@ class M:
         if pairs:
             def undo():
                 m = self._load_trash_meta()
-                for s, t in pairs:
-                    if not t.exists():
-                        raise FileNotFoundError(f"уже нет в корзине: {t.name}")
-                    if s.exists():
-                        raise FileExistsError(f"'{s.name}' уже существует")
-                    shutil.move(str(t), str(s))
-                    m.pop(t.name, None)
-                self._save_trash_meta(m)
+                try:
+                    for s, t in pairs:
+                        if not t.exists():
+                            raise FileNotFoundError(
+                                f"уже нет в корзине: {t.name}")
+                        if s.exists():
+                            raise FileExistsError(
+                                f"'{s.name}' уже существует")
+                        shutil.move(str(t), str(s))
+                        m.pop(t.name, None)
+                finally:
+                    # Сохраняем в любом случае — частично восстановленные
+                    # файлы должны быть удалены из meta, иначе они
+                    # «зависнут» как неотслеживаемые записи.
+                    self._save_trash_meta(m)
 
             def redo():
                 m = self._load_trash_meta()
                 new_pairs = []
-                for s, _old_t in pairs:
-                    if not s.exists():
-                        raise FileNotFoundError(f"исходник отсутствует: {s}")
-                    nt = self._unique_trash_path(s.name)
-                    shutil.move(str(s), str(nt))
-                    m[nt.name] = str(s)
-                    new_pairs.append((s, nt))
-                self._save_trash_meta(m)
-                # обновляем замыкание для следующего undo
-                pairs[:] = new_pairs
+                try:
+                    for s, _old_t in pairs:
+                        if not s.exists():
+                            raise FileNotFoundError(
+                                f"исходник отсутствует: {s}")
+                        nt = self._unique_trash_path(s.name)
+                        shutil.move(str(s), str(nt))
+                        m[nt.name] = str(s)
+                        new_pairs.append((s, nt))
+                finally:
+                    self._save_trash_meta(m)
+                    # Обновляем замыкание даже при частичном успехе.
+                    pairs[:] = new_pairs
 
             desc = (f"удаление '{pairs[0][0].name}'" if len(pairs) == 1
                     else f"удаление {len(pairs)} файлов")
@@ -2706,8 +2754,10 @@ class M:
             self.ed_search_hits = []
             self.ed_search_idx = -1
             self._reset_undo_group()
-            self.hooks.fire("on_file_change", path=str(p))
+            # Порядок: сначала on_open (файл открыт), затем on_file_change
+            # (содержимое загружено). Семантически верно.
             self.hooks.fire("on_open", path=str(p), kind="file")
+            self.hooks.fire("on_file_change", path=str(p))
             return False
         except Exception as e:
             self.set_message(f"Ошибка: {e}")
