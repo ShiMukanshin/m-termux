@@ -2,21 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.2 — поддержка мыши в редакторе и файловом менеджере.
+Версия 6.4.1 — фиксы разделителя панелей и версий.
 
-Изменения относительно 6.1:
-  • Клик мыши в редакторе переносит курсор в точку клика.
-    Позиция колонки пересчитывается через обратное к _visual_col
-    преобразование — табы, CJK и эмодзи учитываются корректно.
-  • Клик в файловом менеджере выбирает элемент в панели.
-    Двойной клик открывает файл/папку. Клик по заголовку панели
-    делает её активной.
-  • Колесо мыши (Button4/Button5) скроллит список в файловом
-    менеджере и текст в редакторе.
-  • _col_to_char() — обратное к _visual_col() преобразование.
-  • mousemask включается в __init__ и при KEY_RESIZE.
-  • Клик в редакторе сбрасывает undo-группу: не продолжает
-    непрерывный ввод после движения курсора мышью.
+Изменения относительно 6.4:
+  • curses.A_VLINE → curses.ACS_VLINE: разделитель между панелями
+    снова рисуется (A_VLINE не существует, а широкий try/except
+    глушил AttributeError — черта молча пропадала).
+  • Версии выровнены на 6.4.1: docstring, титулы экранов, M -v.
+    Раньше UI показывал v6.3.1, а --version печатал v6.4.
+  • _mouse_scroll в редакторе сбрасывает undo-группу — скролл
+    не сливается с последующей печатью в один Ctrl+Z.
+  • В docstring явно сказано: колесо в редакторе двигает КУРСОР
+    (вью следует за ним), а не только вью. Это осознанный выбор
+    для mobile-first: курсор не «теряется» при скролле.
 """
 
 import curses
@@ -198,11 +196,11 @@ class M:
         self.ed_redo_stack = deque(maxlen=200)
         self.ed_search_hits = []
         self.ed_search_idx = -1
+        self.ed_scroll = 0
 
         self._last_edit_time = 0.0
         self._last_edit_kind = None
 
-        # Состояние для распознавания двойного клика
         self._last_click_time = 0.0
         self._last_click_pos = (-1, -1)
 
@@ -301,15 +299,10 @@ class M:
 
     # ==================== МЫШЬ ====================
     def _init_mouse(self):
-        """Включает отслеживание событий мыши.
-        В терминалах без поддержки — просто не будет событий,
-        ничего не сломается."""
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
         except Exception:
             pass
-        # Дефолтный mouseinterval оставляем — нужен для распознавания
-        # BUTTON1_DOUBLE_CLICKED. Явно нулить не надо.
 
     def _handle_mouse(self):
         try:
@@ -317,24 +310,20 @@ class M:
         except Exception:
             return
 
-        # Колесо мыши — универсально для всех режимов
         scroll_up = getattr(curses, "BUTTON4_PRESSED", 0)
         scroll_down = getattr(curses, "BUTTON5_PRESSED", 0)
         if scroll_up and (bstate & scroll_up):
-            self._mouse_scroll(-3)
+            self._mouse_scroll(-1)
             return
         if scroll_down and (bstate & scroll_down):
-            self._mouse_scroll(3)
+            self._mouse_scroll(1)
             return
 
-        # Левый клик: одинарный или двойной
         is_double = bool(bstate & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0))
         is_single = bool(bstate & getattr(curses, "BUTTON1_CLICKED", 0))
         if not (is_double or is_single):
             return
 
-        # В активном промпте мышь не обрабатываем — чтобы клик случайно
-        # не увёл курсор из поля ввода
         if self.prompt_active:
             return
 
@@ -344,12 +333,15 @@ class M:
             self._mouse_files(mx, my, is_double)
 
     def _mouse_scroll(self, delta):
-        """delta < 0 — вверх, delta > 0 — вниз. 3 строки за тик."""
+        """delta < 0 — вверх, delta > 0 — вниз. 1 строка за тик."""
         if self.mode == self.MODE_EDITOR:
             key = curses.KEY_UP if delta < 0 else curses.KEY_DOWN
             for _ in range(abs(delta)):
                 self.editor_edit(key, arrows=True)
             self.clamp_cursor()
+            # Скролл двигает курсор (mobile-first: курсор не теряется),
+            # но разрывает undo-группу, как и стрелки.
+            self._reset_undo_group()
         elif self.mode == self.MODE_FILES:
             idx = self.active
             step = -abs(delta) if delta < 0 else abs(delta)
@@ -362,12 +354,10 @@ class M:
         half = max(10, w // 2)
         pane = 0 if mx < half else 1
 
-        # Клик по заголовку панели — сделать её активной
         if my == 1:
             self.active = pane
             return
 
-        # Клик в области списка файлов: строки 2..h-3
         if not (2 <= my < h - 2):
             return
 
@@ -382,10 +372,8 @@ class M:
         if idx < 0 or idx >= len(self.items[pane]):
             return
 
-        # Активируем панель, куда кликнули
         self.active = pane
 
-        # Двойной клик: либо curses сам распознал, либо по таймеру
         is_double = bool(is_double_from_curses)
         now = time.monotonic()
         if not is_double:
@@ -407,17 +395,10 @@ class M:
     def _mouse_editor(self, mx, my):
         h, w = self.stdscr.getmaxyx()
 
-        # Область текста в редакторе: строки 1..h-3
-        # (0 — заголовок, h-2 — промпт/сообщение, h-1 — статус)
         if not (1 <= my < h - 2):
             return
 
-        visible_h = max(1, h - 3)
-        cy = self.ed_cursor[0]
-        start = 0
-        if cy >= visible_h:
-            start = cy - visible_h + 1
-
+        start = self.ed_scroll
         line_idx = start + (my - 1)
         if line_idx < 0 or line_idx >= len(self.ed_buffer):
             return
@@ -426,12 +407,10 @@ class M:
         cx = self._col_to_char(line, mx)
         self.ed_cursor = [line_idx, cx]
         self.clamp_cursor()
-        # Клик — точка разрыва undo-группы, как и стрелки
         self._reset_undo_group()
 
     # ==================== ВВОД ====================
     def _get_key(self):
-        """Универсальное чтение клавиши с поддержкой Unicode."""
         ch = None
         try:
             ch = self.stdscr.get_wch()
@@ -463,8 +442,6 @@ class M:
 
     @staticmethod
     def _char_width(ch):
-        """0 — combining / ZWJ / VS15 / VS16,
-        2 — Wide/Fullwidth (CJK, эмодзи), 1 — остальное."""
         cp = ord(ch)
         if cp in (0x200D, 0xFE0E, 0xFE0F):
             return 0
@@ -477,7 +454,6 @@ class M:
 
     @staticmethod
     def _visual_col(line, cx, tabstop=TABSTOP):
-        """Логическая колонка → визуальная с учётом табов и CJK/emoji."""
         if cx <= 0:
             return 0
         prefix = line[:cx]
@@ -493,8 +469,6 @@ class M:
 
     @staticmethod
     def _col_to_char(line, target_col, tabstop=TABSTOP):
-        """Обратное к _visual_col: визуальная колонка → индекс символа.
-        Возвращает индекс в диапазоне [0, len(line)]."""
         if target_col <= 0:
             return 0
         col = 0
@@ -607,7 +581,7 @@ class M:
                 f"[{i+1}]" if i == self.active_tab else f" {i+1} "
                 for i in range(len(self.tabs))
             )
-        title = f" M v6.2 {tab_label} — Файлы "
+        title = f" M v6.4.1 {tab_label} — Файлы "
         self.addstr(0, 0, title, self.cp(1, curses.A_BOLD))
 
         half = max(10, w // 2)
@@ -617,7 +591,7 @@ class M:
             if i == 0:
                 for y in range(1, h - 2):
                     try:
-                        self.stdscr.addch(y, half - 1, curses.A_VLINE)
+                        self.stdscr.addch(y, half - 1, curses.ACS_VLINE)
                     except Exception:
                         pass
             self._draw_pane(i, x0, width, h)
@@ -695,9 +669,20 @@ class M:
             self.ed_cursor[0] = 0
         if self.ed_cursor[0] >= len(self.ed_buffer):
             self.ed_cursor[0] = max(0, len(self.ed_buffer) - 1)
-        start = 0
-        if self.ed_cursor[0] >= visible_h:
-            start = self.ed_cursor[0] - visible_h + 1
+
+        cur = self.ed_cursor[0]
+        if cur < self.ed_scroll:
+            self.ed_scroll = cur
+        elif cur >= self.ed_scroll + visible_h:
+            self.ed_scroll = cur - visible_h + 1
+
+        max_scroll = max(0, len(self.ed_buffer) - visible_h)
+        if self.ed_scroll > max_scroll:
+            self.ed_scroll = max_scroll
+        if self.ed_scroll < 0:
+            self.ed_scroll = 0
+
+        start = self.ed_scroll
 
         for screen_row in range(visible_h):
             i = start + screen_row
@@ -862,7 +847,7 @@ class M:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         lines = [
-            "  M v6.2 — универсальный инструмент Termux  ",
+            "  M v6.4.1 — универсальный инструмент Termux  ",
             "",
             "  ФЛАГИ:  M -e [FILE] | -m NAME | -i SRC DST | -c SRC DST | -h | -v",
             "",
@@ -891,7 +876,7 @@ class M:
             "  МЫШЬ:",
             "    клик         выбрать файл / панель",
             "    двойной клик открыть",
-            "    колесо       скролл",
+            "    колесо       скролл (1 строка за тик)",
             "",
             "  РЕДАКТОР: F1 или Ctrl+P внутри редактора",
             "",
@@ -939,7 +924,7 @@ class M:
             "",
             "  МЫШЬ:",
             "    клик         перенести курсор в точку клика",
-            "    колесо       скролл текста",
+            "    колесо       скролл текста (1 строка за тик)",
             "",
             "  Нажми любую клавишу…",
         ]
@@ -1423,7 +1408,6 @@ class M:
                 time.sleep(0.02)
                 continue
 
-            # Событие мыши — обрабатываем отдельно
             if key == curses.KEY_MOUSE:
                 self._handle_mouse()
                 continue
@@ -2297,6 +2281,9 @@ class M:
         if not old:
             self.set_message("Пустая строка поиска.")
             return
+        if old == new:
+            self.set_message("Строки совпадают.")
+            return
         found = any(old in line for line in self.ed_buffer)
         if not found:
             self.set_message("Не найдено.")
@@ -2335,6 +2322,7 @@ class M:
             self.ed_filename = str(p)
             self.ed_cursor = [0, 0]
             self.ed_modified = False
+            self.ed_scroll = 0
             self.ed_undo_stack.clear()
             self.ed_redo_stack.clear()
             self.ed_search_hits = []
@@ -2445,7 +2433,7 @@ def main():
             sys.exit(1)
         return
     if flag in ("-v", "--version"):
-        print("M v6.2")
+        print("M v6.4.1")
         return
 
     if flag and flag.startswith("-") and flag not in ("-e", "--edit"):
