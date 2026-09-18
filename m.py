@@ -839,7 +839,7 @@ class M:
                         pass
             self._draw_pane(i, x0, width, h)
 
-        status = " Enter:откр m:папка n:новый i:пер c:коп d:удал r:имя e:ред q:выход "
+        status = " Enter:откр m:папка n:новый i:пер c:коп d:удал r:имя e:ред q:выход ?:справка"
 
         if self.prompt_active:
             self._draw_prompt(h, w)
