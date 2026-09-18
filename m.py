@@ -2,22 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.9.
+Версия 6.6.0.
 
-Изменения относительно 6.5.8:
-  • do_rename: undo/redo синхронизируют marked в той панели, где было
-    переименование, а не в текущей активной. Раньше после Tab → u метка
-    оставалась на несуществующем пути.
-  • Битые симлинки больше не выпадают из отметок и операций: проверка
-    через os.path.lexists() вместо Path.exists().
-  • _prompt_delete и _get_operation_sources используют общий helper
-    _live_marks() — счётчик в промпте совпадает с реально удаляемым.
-  • Переключение вкладок сохраняет marked — состояние не теряется.
-  • -i и -c делают expanduser (совместимо с -m).
-  • _editor_open_confirm/_editor_exit при отсутствии имени файла
-    дают понятное сообщение вместо вводящего в заблуждение.
+Изменения относительно 6.5.9:
+  • КРИТИЧНО: undo/redo переименования корректно работают между
+    вкладками. Раньше замыкание обращалось к self.marked[panel]
+    динамически, а смена вкладки пересоздавала множества — метка
+    оставалась на несуществующем пути. Теперь:
+      – вкладки хранят marked по ссылке (не копией);
+      – do_rename захватывает set-объект в замыкание;
+      – do_move/do_copy мутируют set in-place (не пересоздают).
+  • do_delete.undo использует path_exists_lexists(t) вместо t.exists()
+    — undo битого симлинка больше не падает.
+  • _register_move_undo использует lexists — undo/redo перемещения
+    битого симлинка работает.
+  • _trash_delete_permanent / _trash_clear корректно удаляют
+    симлинки-на-каталоги (is_symlink перед is_dir).
+  • _trash_restore использует lexists для целевого пути —
+    битый симлинк на месте оригинала не перезатирается молча.
+  • Сообщения _editor_open_confirm/_editor_exit/save_editor
+    не вводят в заблуждение (совет не «Ctrl+S», а «ответьте n»).
+
+Базовые изменения 6.5.9 (сохранены):
+  • do_rename переносит отметку на новый путь (внутри панели).
+  • Битые симлинки не выпадают из _live_marks.
+  • Переключение вкладок сохраняет marked.
+  • -i / -c делают expanduser.
   • open_in_editor на '..' сообщает, что редактировать нечего.
-  • save_editor: корректный текст сообщения про отсутствие имени.
 """
 
 import curses
@@ -37,7 +48,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.9"
+__version__ = "6.6.0"
 
 
 HOME = Path.home()
@@ -126,6 +137,20 @@ def path_exists_lexists(p):
         return os.path.lexists(str(p))
     except Exception:
         return False
+
+
+def _remove_any(path):
+    """
+    Удаляет файл, каталог или симлинк безопасно:
+    rmtree по симлинку на каталог — ошибка, поэтому проверяем is_symlink
+    до is_dir.
+    """
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
 class HookManager:
@@ -299,7 +324,11 @@ class M:
         self.active = 0
         self.selected = [0, 0]
         self.items = [[], []]
-        self.marked = [set(), set()]
+        # marked хранится по ссылке в tabs — это критично для замыканий
+        # undo/redo (см. do_rename). Никогда не пересоздаём set-объекты,
+        # только мутируем содержимое.
+        init_marked = [set(), set()]
+        self.marked = init_marked
         self.show_hidden = False
         self.fm_hits = []
         self.fm_hit_idx = -1
@@ -308,7 +337,7 @@ class M:
             "panes": [cwd, cwd],
             "selected": [0, 0],
             "active": 0,
-            "marked": [set(), set()],
+            "marked": init_marked,
         }]
         self.active_tab = 0
 
@@ -1415,13 +1444,14 @@ class M:
                 self.set_message("Некорректный путь в метаданных — отказ.")
                 return
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists():
+            # lexists, чтобы не перезатереть битый симлинк молча.
+            if path_exists_lexists(dst):
                 base_dst = dst
                 counter = 1
-                while dst.exists() and counter <= 100:
+                while path_exists_lexists(dst) and counter <= 100:
                     dst = base_dst.parent / f"{base_dst.name}_restored{counter}"
                     counter += 1
-                if dst.exists():
+                if path_exists_lexists(dst):
                     self.set_message(
                         "Слишком много конфликтов имён при восстановлении."
                     )
@@ -1436,10 +1466,7 @@ class M:
     def _trash_delete_permanent(self, item):
         name, path = item
         try:
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
+            _remove_any(path)
             meta = self._load_trash_meta()
             meta.pop(name, None)
             self._save_trash_meta(meta)
@@ -1455,10 +1482,7 @@ class M:
                 for p in list(TRASH_DIR.iterdir()):
                     if p.name.startswith('.'):
                         continue
-                    if p.is_dir():
-                        shutil.rmtree(p)
-                    else:
-                        p.unlink()
+                    _remove_any(p)
                 self._save_trash_meta({})
                 self.set_message("Корзина очищена.")
                 self.bm_idx = 0
@@ -1976,34 +2000,37 @@ class M:
             self.set_message("Цель уже существует.")
             return
         try:
-            # Фиксируем панель, в которой произошло переименование: undo/redo
-            # могут быть вызваны после переключения панели или вкладки.
+            # Захватываем панель И set-объект: undo/redo могут быть вызваны
+            # после переключения панели/вкладки, когда self.marked уже
+            # указывает на другое множество.
             panel = self.active
+            marked_set = self.marked[panel]
+
             src.rename(dst)
             self.set_message(f"Переименовано: {entry.name} → {newname}")
             self.refresh_pane(panel)
             self.hooks.fire("on_move", src=str(src), dst=str(dst))
 
             old_s, new_s = str(src), str(dst)
-            if old_s in self.marked[panel]:
-                self.marked[panel].discard(old_s)
-                self.marked[panel].add(new_s)
+            if old_s in marked_set:
+                marked_set.discard(old_s)
+                marked_set.add(new_s)
 
             def undo():
-                if dst.exists() and not src.exists():
+                if path_exists_lexists(dst) and not path_exists_lexists(src):
                     dst.rename(src)
-                    if new_s in self.marked[panel]:
-                        self.marked[panel].discard(new_s)
-                        self.marked[panel].add(old_s)
+                    if new_s in marked_set:
+                        marked_set.discard(new_s)
+                        marked_set.add(old_s)
                 else:
                     raise OSError("невозможно откатить")
 
             def redo():
-                if src.exists() and not dst.exists():
+                if path_exists_lexists(src) and not path_exists_lexists(dst):
                     src.rename(dst)
-                    if old_s in self.marked[panel]:
-                        self.marked[panel].discard(old_s)
-                        self.marked[panel].add(new_s)
+                    if old_s in marked_set:
+                        marked_set.discard(old_s)
+                        marked_set.add(new_s)
                 else:
                     raise OSError("невозможно повторить")
 
@@ -2060,7 +2087,9 @@ class M:
                 m = self._load_trash_meta()
                 try:
                     for s, t in pairs:
-                        if not t.exists():
+                        # lexists: битый симлинк в корзине тоже должен
+                        # считаться «присутствующим».
+                        if not path_exists_lexists(t):
                             raise FileNotFoundError(
                                 f"уже нет в корзине: {t.name}")
                         if path_exists_lexists(s):
@@ -2132,7 +2161,7 @@ class M:
 
         for src in sources:
             dst = dst_dir / src.name
-            if dst.exists():
+            if path_exists_lexists(dst):
                 last_error = f"Пропущено (существует): {src.name}"
                 failed.append(src)
                 continue
@@ -2147,24 +2176,28 @@ class M:
                 last_error = f"Ошибка: {e}"
                 failed.append(src)
 
+        # Мутируем set in-place — нельзя пересоздавать объект, иначе
+        # замыкания undo/redo переименования потеряют свою цель.
+        m = self.marked[self.active]
         if failed:
-            self.marked[self.active] = set(str(p) for p in failed)
+            m.clear()
+            m.update(str(p) for p in failed)
             self.set_message(last_error or "Некоторые файлы не перемещены.")
         else:
-            self.marked[self.active].clear()
+            m.clear()
             self.set_message(f"Перемещено: {success}. (u — отменить)")
         self.refresh_pane(0)
         self.refresh_pane(1)
 
     def _register_move_undo(self, src, dst):
         def undo():
-            if dst.exists() and not src.exists():
+            if path_exists_lexists(dst) and not path_exists_lexists(src):
                 shutil.move(str(dst), str(src))
             else:
                 raise OSError("невозможно откатить")
 
         def redo():
-            if src.exists() and not dst.exists():
+            if path_exists_lexists(src) and not path_exists_lexists(dst):
                 shutil.move(str(src), str(dst))
             else:
                 raise OSError("невозможно повторить")
@@ -2184,7 +2217,7 @@ class M:
 
         for src in sources:
             dst = dst_dir / src.name
-            if dst.exists():
+            if path_exists_lexists(dst):
                 last_error = f"Пропущено (существует): {src.name}"
                 failed.append(src)
                 continue
@@ -2202,26 +2235,25 @@ class M:
                 last_error = f"Ошибка: {e}"
                 failed.append(src)
 
+        m = self.marked[self.active]
         if failed:
-            self.marked[self.active] = set(str(p) for p in failed)
+            m.clear()
+            m.update(str(p) for p in failed)
             self.set_message(last_error or "Некоторые файлы не скопированы.")
         else:
-            self.marked[self.active].clear()
+            m.clear()
             self.set_message(f"Скопировано: {success}. (u — отменить)")
         self.refresh_pane(0)
         self.refresh_pane(1)
 
     def _register_copy_undo(self, src, dst):
         def undo():
-            if not dst.exists():
+            if not path_exists_lexists(dst):
                 raise FileNotFoundError("копия уже удалена")
-            if dst.is_dir():
-                shutil.rmtree(dst)
-            else:
-                dst.unlink()
+            _remove_any(dst)
 
         def redo():
-            if dst.exists():
+            if path_exists_lexists(dst):
                 raise FileExistsError("цель уже существует")
             if src.is_dir():
                 shutil.copytree(src, dst)
@@ -2278,13 +2310,22 @@ class M:
             self.set_message(f"Закладка: {current}")
         self.save_bookmarks()
 
+    # ==================== ВКЛАДКИ ====================
     def _save_tab_state(self):
-        self.tabs[self.active_tab]["panes"] = list(self.panes)
-        self.tabs[self.active_tab]["selected"] = list(self.selected)
-        self.tabs[self.active_tab]["active"] = self.active
-        self.tabs[self.active_tab]["marked"] = [
-            set(self.marked[0]), set(self.marked[1])
-        ]
+        tab = self.tabs[self.active_tab]
+        tab["panes"] = list(self.panes)
+        tab["selected"] = list(self.selected)
+        tab["active"] = self.active
+        # marked сохраняем ПО ССЫЛКЕ: любое замыкание undo/redo, держащее
+        # set-объект, должно видеть изменения после возврата во вкладку.
+        tab["marked"] = self.marked
+
+    def _take_tab_marked(self, tab):
+        m = tab.get("marked")
+        if m is None:
+            m = [set(), set()]
+            tab["marked"] = m
+        return m
 
     def switch_tab(self, idx):
         if idx == self.active_tab or idx < 0 or idx >= len(self.tabs):
@@ -2295,7 +2336,7 @@ class M:
         self.panes = list(tab["panes"])
         self.selected = list(tab["selected"])
         self.active = tab["active"]
-        self.marked = [set(m) for m in tab.get("marked", [set(), set()])]
+        self.marked = self._take_tab_marked(tab)
         self.fm_hits = []
         self.fm_hit_idx = -1
         self.refresh_pane(0)
@@ -2305,17 +2346,18 @@ class M:
     def new_tab(self):
         self._save_tab_state()
         cwd = self.panes[self.active]
+        new_marked = [set(), set()]
         self.tabs.append({
             "panes": [cwd, cwd],
             "selected": [0, 0],
             "active": 0,
-            "marked": [set(), set()],
+            "marked": new_marked,
         })
         self.active_tab = len(self.tabs) - 1
         self.panes = [cwd, cwd]
         self.selected = [0, 0]
         self.active = 0
-        self.marked = [set(), set()]
+        self.marked = new_marked
         self.fm_hits = []
         self.fm_hit_idx = -1
         self.refresh_pane(0)
@@ -2332,13 +2374,14 @@ class M:
         self.panes = list(tab["panes"])
         self.selected = list(tab["selected"])
         self.active = tab["active"]
-        self.marked = [set(m) for m in tab.get("marked", [set(), set()])]
+        self.marked = self._take_tab_marked(tab)
         self.fm_hits = []
         self.fm_hit_idx = -1
         self.refresh_pane(0)
         self.refresh_pane(1)
         self.set_message("Вкладка закрыта.")
 
+    # ==================== РЕДАКТОР ====================
     def _snapshot(self):
         return (list(self.ed_buffer), list(self.ed_cursor), self.ed_modified)
 
@@ -2390,7 +2433,10 @@ class M:
 
     def save_editor(self):
         if not self.ed_filename:
-            self.set_message("Файл без имени. Сначала откройте через Ctrl+O.")
+            self.set_message(
+                "Файл без имени — сохранение недоступно. "
+                "Откройте через Ctrl+O."
+            )
             return False
         try:
             p = Path(self.ed_filename)
@@ -2491,7 +2537,10 @@ class M:
     def _editor_open_confirm(self, ans):
         if ans == 'y':
             if not self.ed_filename:
-                self.set_message("Файл без имени. Сначала сохраните через Ctrl+S.")
+                self.set_message(
+                    "Файл без имени — сохранить нельзя. "
+                    "Ответьте 'n', чтобы открыть без сохранения."
+                )
                 return
             if not self.save_editor():
                 return
@@ -2500,7 +2549,10 @@ class M:
     def _editor_exit(self, ans):
         if ans == 'y':
             if not self.ed_filename:
-                self.set_message("Файл без имени. Сначала сохраните через Ctrl+S.")
+                self.set_message(
+                    "Файл без имени — сохранить нельзя. "
+                    "Ответьте 'n', чтобы выйти без сохранения."
+                )
                 return
             if not self.save_editor():
                 return
