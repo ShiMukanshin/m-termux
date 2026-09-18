@@ -2,35 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 M — универсальный инструмент «всё в одном» для Termux (mobile-first).
-Версия 6.5.3 — фикс ввода в редакторе, прав сохранения, батч-хука.
+Версия 6.5.4 — правки по итогам ревью 6.5.3.
 
-Изменения относительно 6.5.2:
-  • КРИТИЧНО: редактор снова принимает Enter. В 6.5.2 curses.KEY_ENTER
-    не был включён в обработку ни handle_editor_key, ни editor_edit —
-    на части терминалов (в т. ч. некоторых сборках Termux) Enter
-    в редакторе не делал ничего. Добавлен во все ветки.
-  • atomic_write_text сохраняет права существующего файла. mkstemp
-    создаёт 0600, и os.replace «съедал» прежние 0644 — конфиг,
-    закладки и meta теряли режим. Теперь права переносятся.
-  • editor_open_file отвергает не-обычные файлы (FIFO, /dev/*) —
-    раньше read_text на /dev/zero повесил бы процесс.
-  • do_mkdir: если папка уже существует — сообщение, а не «создана».
-  • do_delete: хуки on_delete в батче запускаются с уменьшенным
-    таймаутом (0.3 с на файл вместо 2 с). Убирает потенциальный
-    фриз UI на N × HOOK_TIMEOUT при массовом удалении с медленным
-    хуком. Для одиночного удаления — прежний HOOK_TIMEOUT.
-  • _prompt_delete: согласованная формулировка для 1 и N файлов
-    ("Удалить в корзину: N шт.?").
-  • _draw_prompt: убран лишний ведущий пробел при выводе self.message.
-  • HookManager.fire принимает timeout= — переопределение на вызов.
-  • Шапка приведена в порядок.
+Изменения относительно 6.5.3:
+  • KEY_RESIZE обрабатывается в главном цикле до промпта — раньше при
+    активном Ctrl+O / поиске / y/n и повороте экрана лэйаут не
+    пересчитывался до следующей нажатой клавиши.
+  • do_copy и do_move теперь применяют батч-таймаут хуков
+    (HOOK_TIMEOUT_BATCH) при массовых операциях — как do_delete.
+    Устраняет фриз UI на N × HOOK_TIMEOUT при медленном хуке.
+  • _trash_restore при конфликте имён подбирает уникальный суффикс
+    _restored1..100, а не одну единственную форму — второй конфликт
+    больше не роняет восстановление.
+  • Шапка: дополнены комментарии по семантике хуков.
 
-Базовые изменения 6.5.2 (сохранены):
-  • draw_editor не затирает промпт статусом.
-  • do_delete: undo/redo в try/finally, meta сохраняется каждые
-    TRASH_SAVE_EVERY удалений.
-  • _DANGEROUS_RESTORE_PREFIXES расширен (/system, /vendor, /apex, ...).
-  • Порядок on_open → on_file_change.
+Базовые изменения 6.5.3 (сохранены):
+  • Enter в редакторе принимает curses.KEY_ENTER.
+  • atomic_write_text сохраняет права существующего файла.
+  • editor_open_file отвергает FIFO, /dev/*, сокеты.
+  • do_mkdir: «уже существует» — отдельное сообщение.
+  • do_delete: on_delete в батче с укороченным таймаутом.
+  • _prompt_delete: согласованная формулировка для 1 и N файлов.
+  • _draw_prompt: убран лишний ведущий пробел у message.
+  • HookManager.fire принимает timeout=.
 """
 
 import curses
@@ -50,7 +44,7 @@ from pathlib import Path
 from collections import deque, namedtuple
 
 
-__version__ = "6.5.3"
+__version__ = "6.5.4"
 
 
 # ============================ ПУТИ ============================
@@ -78,8 +72,8 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico")
 TABSTOP = 8
 
 MAX_EDITOR_FILE = 10 * 1024 * 1024  # 10 MB
-HOOK_TIMEOUT = 2.0  # секунд, для одиночных событий
-HOOK_TIMEOUT_BATCH = 0.3  # секунд на файл при батче (например, on_delete)
+HOOK_TIMEOUT = 2.0          # секунд, для одиночных событий
+HOOK_TIMEOUT_BATCH = 0.3    # секунд на файл при батче (on_delete/on_create/on_move)
 TRASH_SAVE_EVERY = 10
 
 # Единица списка панели
@@ -233,7 +227,10 @@ class HookManager:
         """
         Событие-действие. Для TIMEOUT_EVENTS — с таймаутом.
         timeout= переопределяет HOOK_TIMEOUT на один вызов
-        (используется для батчей, см. do_delete).
+        (используется для батчей, см. do_delete/do_copy/do_move).
+
+        ВНИМАНИЕ: параметр `timeout` перехватывается и НЕ передаётся в хук.
+        Если вашему хуку нужен свой timeout — назовите параметр иначе.
         """
         timed = event in self.TIMEOUT_EVENTS
         actual_timeout = HOOK_TIMEOUT if timeout is None else timeout
@@ -1020,6 +1017,7 @@ class M:
             except Exception:
                 pass
 
+        # Внешний спан побеждает вложенный.
         spans = sorted(normal_spans, key=lambda s: (s[0], -s[1]))
         cleaned = []
         last_end = 0
@@ -1457,8 +1455,20 @@ class M:
                 self.set_message("Некорректный путь в метаданных — отказ.")
                 return
             dst.parent.mkdir(parents=True, exist_ok=True)
+            # Если целевое имя занято, подбираем уникальный суффикс.
+            # Раньше была единственная форма "_restored" — при повторе
+            # конфликта shutil.move падал и файл оставался в корзине.
             if dst.exists():
-                dst = dst.parent / (dst.name + "_restored")
+                base_dst = dst
+                counter = 1
+                while dst.exists() and counter <= 100:
+                    dst = base_dst.parent / f"{base_dst.name}_restored{counter}"
+                    counter += 1
+                if dst.exists():
+                    self.set_message(
+                        "Слишком много конфликтов имён при восстановлении."
+                    )
+                    return
             shutil.move(str(path), str(dst))
             meta.pop(name, None)
             self._save_trash_meta(meta)
@@ -1673,6 +1683,16 @@ class M:
                 self._handle_mouse()
                 continue
 
+            # KEY_RESIZE обрабатываем до промпта — иначе при активном
+            # вводе (y/n, Ctrl+O, поиск) поворот экрана не пересчитывал
+            # лэйаут до следующей клавиши.
+            if key == curses.KEY_RESIZE:
+                self._init_mouse()
+                if self.mode == self.MODE_FILES:
+                    self.refresh_pane(0)
+                    self.refresh_pane(1)
+                continue
+
             if self.prompt_active:
                 self.handle_prompt_key(key)
                 continue
@@ -1857,10 +1877,6 @@ class M:
         elif key == ord('?'):
             self.return_mode = self.MODE_FILES
             self.mode = self.MODE_HELP
-        elif key == curses.KEY_RESIZE:
-            self._init_mouse()
-            self.refresh_pane(0)
-            self.refresh_pane(1)
 
     def _prompt_delete(self):
         """Формирует промпт удаления с учётом отметок."""
@@ -2047,7 +2063,6 @@ class M:
         last_error = ""
         moved_since_save = 0
 
-        # Таймаут хука: полный для одиночного удаления, короткий в батче.
         hook_timeout = HOOK_TIMEOUT if len(sources) == 1 else HOOK_TIMEOUT_BATCH
 
         for src in sources:
@@ -2141,6 +2156,9 @@ class M:
         success = 0
         last_error = ""
 
+        # Батч-таймаут хука при массовой операции — как в do_delete.
+        hook_timeout = HOOK_TIMEOUT if len(sources) == 1 else HOOK_TIMEOUT_BATCH
+
         for src in sources:
             dst = dst_dir / src.name
             if dst.exists():
@@ -2149,7 +2167,9 @@ class M:
                 continue
             try:
                 shutil.move(str(src), str(dst))
-                self.hooks.fire("on_move", src=str(src), dst=str(dst))
+                self.hooks.fire("on_move",
+                                timeout=hook_timeout,
+                                src=str(src), dst=str(dst))
                 self._register_move_undo(src, dst)
                 success += 1
             except Exception as e:
@@ -2189,6 +2209,9 @@ class M:
         success = 0
         last_error = ""
 
+        # Батч-таймаут хука при массовой операции — как в do_delete.
+        hook_timeout = HOOK_TIMEOUT if len(sources) == 1 else HOOK_TIMEOUT_BATCH
+
         for src in sources:
             dst = dst_dir / src.name
             if dst.exists():
@@ -2200,7 +2223,9 @@ class M:
                     shutil.copytree(src, dst)
                 else:
                     shutil.copy2(src, dst)
-                self.hooks.fire("on_create", path=str(dst), kind="copy")
+                self.hooks.fire("on_create",
+                                timeout=hook_timeout,
+                                path=str(dst), kind="copy")
                 self._register_copy_undo(src, dst)
                 success += 1
             except Exception as e:
